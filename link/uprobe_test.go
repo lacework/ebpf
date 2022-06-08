@@ -31,55 +31,68 @@ func TestExecutable(t *testing.T) {
 		t.Fatalf("create executable: unexpected path '%s'", bashEx.path)
 	}
 
-	_, err = bashEx.offset(bashSym)
+	_, err = bashEx.offset(bashSym, &UprobeOptions{})
 	if err != nil {
 		t.Fatalf("find offset: %v", err)
 	}
 
-	_, err = bashEx.offset("bogus")
+	_, err = bashEx.offset("bogus", &UprobeOptions{})
 	if err == nil {
 		t.Fatal("find symbol: expected error")
 	}
 }
 
-func TestUprobe(t *testing.T) {
+func TestExecutableOffset(t *testing.T) {
 	c := qt.New(t)
 
-	prog, err := ebpf.NewProgram(&kprobeSpec)
+	symbolOffset, err := bashEx.offset(bashSym, &UprobeOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer prog.Close()
+
+	offset, err := bashEx.offset(bashSym, &UprobeOptions{Offset: 0x1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Assert(offset, qt.Equals, uint64(0x1))
+
+	offset, err = bashEx.offset(bashSym, &UprobeOptions{RelativeOffset: 0x2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Assert(offset, qt.Equals, symbolOffset+0x2)
+
+	offset, err = bashEx.offset(bashSym, &UprobeOptions{Offset: 0x1, RelativeOffset: 0x2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Assert(offset, qt.Equals, uint64(0x1+0x2))
+}
+
+func TestUprobe(t *testing.T) {
+	c := qt.New(t)
+
+	prog := mustLoadProgram(t, ebpf.Kprobe, 0, "")
 
 	up, err := bashEx.Uprobe(bashSym, prog, nil)
 	c.Assert(err, qt.IsNil)
 	defer up.Close()
 
-	testLink(t, up, testLinkOptions{
-		prog: prog,
-	})
+	testLink(t, up, prog)
 }
 
 func TestUprobeExtNotFound(t *testing.T) {
-	prog, err := ebpf.NewProgram(&kprobeSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
+	prog := mustLoadProgram(t, ebpf.Kprobe, 0, "")
 
 	// This symbol will not be present in Executable (elf.SHN_UNDEF).
-	_, err = bashEx.Uprobe("open", prog, nil)
+	_, err := bashEx.Uprobe("open", prog, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
 }
 
 func TestUprobeExtWithOpts(t *testing.T) {
-	prog, err := ebpf.NewProgram(&kprobeSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
+	prog := mustLoadProgram(t, ebpf.Kprobe, 0, "")
 
 	// This Uprobe is broken and will not work because the offset is not
 	// correct. This is expected since the offset is provided by the user.
@@ -91,11 +104,7 @@ func TestUprobeExtWithOpts(t *testing.T) {
 }
 
 func TestUprobeWithPID(t *testing.T) {
-	prog, err := ebpf.NewProgram(&kprobeSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
+	prog := mustLoadProgram(t, ebpf.Kprobe, 0, "")
 
 	up, err := bashEx.Uprobe(bashSym, prog, &UprobeOptions{PID: os.Getpid()})
 	if err != nil {
@@ -105,14 +114,10 @@ func TestUprobeWithPID(t *testing.T) {
 }
 
 func TestUprobeWithNonExistentPID(t *testing.T) {
-	prog, err := ebpf.NewProgram(&kprobeSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
+	prog := mustLoadProgram(t, ebpf.Kprobe, 0, "")
 
 	// trying to open a perf event on a non-existent PID will return ESRCH.
-	_, err = bashEx.Uprobe(bashSym, prog, &UprobeOptions{PID: -2})
+	_, err := bashEx.Uprobe(bashSym, prog, &UprobeOptions{PID: -2})
 	if !errors.Is(err, unix.ESRCH) {
 		t.Fatalf("expected ESRCH, got %v", err)
 	}
@@ -121,19 +126,13 @@ func TestUprobeWithNonExistentPID(t *testing.T) {
 func TestUretprobe(t *testing.T) {
 	c := qt.New(t)
 
-	prog, err := ebpf.NewProgram(&kprobeSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
+	prog := mustLoadProgram(t, ebpf.Kprobe, 0, "")
 
 	up, err := bashEx.Uretprobe(bashSym, prog, nil)
 	c.Assert(err, qt.IsNil)
 	defer up.Close()
 
-	testLink(t, up, testLinkOptions{
-		prog: prog,
-	})
+	testLink(t, up, prog)
 }
 
 // Test u(ret)probe creation using perf_uprobe PMU.
@@ -144,18 +143,27 @@ func TestUprobeCreatePMU(t *testing.T) {
 	c := qt.New(t)
 
 	// Fetch the offset from the /bin/bash Executable already defined.
-	off, err := bashEx.offset(bashSym)
+	off, err := bashEx.offset(bashSym, &UprobeOptions{})
 	c.Assert(err, qt.IsNil)
 
+	// Prepare probe args.
+	args := probeArgs{
+		symbol: bashSym,
+		path:   bashEx.path,
+		offset: off,
+		pid:    perfAllThreads,
+	}
+
 	// uprobe PMU
-	pu, err := pmuUprobe(bashSym, bashEx.path, off, perfAllThreads, false)
+	pu, err := pmuUprobe(args)
 	c.Assert(err, qt.IsNil)
 	defer pu.Close()
 
 	c.Assert(pu.typ, qt.Equals, uprobeEvent)
 
 	// uretprobe PMU
-	pr, err := pmuUprobe(bashSym, bashEx.path, off, perfAllThreads, true)
+	args.ret = true
+	pr, err := pmuUprobe(args)
 	c.Assert(err, qt.IsNil)
 	defer pr.Close()
 
@@ -167,10 +175,18 @@ func TestUprobePMUUnavailable(t *testing.T) {
 	c := qt.New(t)
 
 	// Fetch the offset from the /bin/bash Executable already defined.
-	off, err := bashEx.offset(bashSym)
+	off, err := bashEx.offset(bashSym, &UprobeOptions{})
 	c.Assert(err, qt.IsNil)
 
-	pk, err := pmuUprobe(bashSym, bashEx.path, off, perfAllThreads, false)
+	// Prepare probe args.
+	args := probeArgs{
+		symbol: bashSym,
+		path:   bashEx.path,
+		offset: off,
+		pid:    perfAllThreads,
+	}
+
+	pk, err := pmuUprobe(args)
 	if err == nil {
 		pk.Close()
 		t.Skipf("Kernel supports perf_uprobe PMU, not asserting error.")
@@ -185,30 +201,37 @@ func TestUprobeTraceFS(t *testing.T) {
 	c := qt.New(t)
 
 	// Fetch the offset from the /bin/bash Executable already defined.
-	off, err := bashEx.offset(bashSym)
+	off, err := bashEx.offset(bashSym, &UprobeOptions{})
 	c.Assert(err, qt.IsNil)
 
-	// Sanitize the symbol in order to be used in tracefs API.
-	ssym := uprobeSanitizedSymbol(bashSym)
+	// Prepare probe args.
+	args := probeArgs{
+		symbol: sanitizeSymbol(bashSym),
+		path:   bashEx.path,
+		offset: off,
+		pid:    perfAllThreads,
+	}
 
 	// Open and close tracefs u(ret)probes, checking all errors.
-	up, err := tracefsUprobe(ssym, bashEx.path, off, perfAllThreads, false)
+	up, err := tracefsUprobe(args)
 	c.Assert(err, qt.IsNil)
 	c.Assert(up.Close(), qt.IsNil)
 	c.Assert(up.typ, qt.Equals, uprobeEvent)
 
-	up, err = tracefsUprobe(ssym, bashEx.path, off, perfAllThreads, true)
+	args.ret = true
+	up, err = tracefsUprobe(args)
 	c.Assert(err, qt.IsNil)
 	c.Assert(up.Close(), qt.IsNil)
 	c.Assert(up.typ, qt.Equals, uretprobeEvent)
 
 	// Create two identical trace events, ensure their IDs differ.
-	u1, err := tracefsUprobe(ssym, bashEx.path, off, perfAllThreads, false)
+	args.ret = false
+	u1, err := tracefsUprobe(args)
 	c.Assert(err, qt.IsNil)
 	defer u1.Close()
 	c.Assert(u1.tracefsID, qt.Not(qt.Equals), 0)
 
-	u2, err := tracefsUprobe(ssym, bashEx.path, off, perfAllThreads, false)
+	u2, err := tracefsUprobe(args)
 	c.Assert(err, qt.IsNil)
 	defer u2.Close()
 	c.Assert(u2.tracefsID, qt.Not(qt.Equals), 0)
@@ -227,11 +250,11 @@ func TestUprobeCreateTraceFS(t *testing.T) {
 	c := qt.New(t)
 
 	// Fetch the offset from the /bin/bash Executable already defined.
-	off, err := bashEx.offset(bashSym)
+	off, err := bashEx.offset(bashSym, &UprobeOptions{})
 	c.Assert(err, qt.IsNil)
 
 	// Sanitize the symbol in order to be used in tracefs API.
-	ssym := uprobeSanitizedSymbol(bashSym)
+	ssym := sanitizeSymbol(bashSym)
 
 	pg, _ := randomGroup("ebpftest")
 	rg, _ := randomGroup("ebpftest")
@@ -242,24 +265,35 @@ func TestUprobeCreateTraceFS(t *testing.T) {
 		_ = closeTraceFSProbeEvent(uprobeType, rg, ssym)
 	}()
 
+	// Prepare probe args.
+	args := probeArgs{
+		group:  pg,
+		symbol: ssym,
+		path:   bashEx.path,
+		offset: off,
+	}
+
 	// Create a uprobe.
-	err = createTraceFSProbeEvent(uprobeType, pg, ssym, bashEx.path, off, false)
+	err = createTraceFSProbeEvent(uprobeType, args)
 	c.Assert(err, qt.IsNil)
 
 	// Attempt to create an identical uprobe using tracefs,
 	// expect it to fail with os.ErrExist.
-	err = createTraceFSProbeEvent(uprobeType, pg, ssym, bashEx.path, off, false)
+	err = createTraceFSProbeEvent(uprobeType, args)
 	c.Assert(errors.Is(err, os.ErrExist), qt.IsTrue,
 		qt.Commentf("expected consecutive uprobe creation to contain os.ErrExist, got: %v", err))
 
 	// Expect a successful close of the kprobe.
 	c.Assert(closeTraceFSProbeEvent(uprobeType, pg, ssym), qt.IsNil)
 
+	args.group = rg
+	args.ret = true
+
 	// Same test for a kretprobe.
-	err = createTraceFSProbeEvent(uprobeType, rg, ssym, bashEx.path, off, true)
+	err = createTraceFSProbeEvent(uprobeType, args)
 	c.Assert(err, qt.IsNil)
 
-	err = createTraceFSProbeEvent(uprobeType, rg, ssym, bashEx.path, off, true)
+	err = createTraceFSProbeEvent(uprobeType, args)
 	c.Assert(os.IsExist(err), qt.IsFalse,
 		qt.Commentf("expected consecutive uretprobe creation to contain os.ErrExist, got: %v", err))
 
@@ -273,14 +307,16 @@ func TestUprobeSanitizedSymbol(t *testing.T) {
 		expected string
 	}{
 		{"readline", "readline"},
-		{"main.Func", "main_Func"},
+		{"main.Func123", "main_Func123"},
 		{"a.....a", "a_a"},
 		{"./;'{}[]a", "_a"},
+		{"***xx**xx###", "_xx_xx_"},
+		{`@P#r$i%v^3*+t)i&k++--`, "_P_r_i_v_3_t_i_k_"},
 	}
 
 	for i, tt := range tests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			sanitized := uprobeSanitizedSymbol(tt.symbol)
+			sanitized := sanitizeSymbol(tt.symbol)
 			if tt.expected != sanitized {
 				t.Errorf("Expected sanitized symbol to be '%s', got '%s'", tt.expected, sanitized)
 			}
@@ -288,21 +324,22 @@ func TestUprobeSanitizedSymbol(t *testing.T) {
 	}
 }
 
-func TestUprobePathOffset(t *testing.T) {
+func TestUprobeToken(t *testing.T) {
 	tests := []struct {
-		path     string
-		offset   uint64
+		args     probeArgs
 		expected string
 	}{
-		{"/bin/bash", 0, "/bin/bash:0x0"},
-		{"/bin/bash", 1, "/bin/bash:0x1"},
-		{"/bin/bash", 65535, "/bin/bash:0xffff"},
-		{"/bin/bash", 65536, "/bin/bash:0x10000"},
+		{probeArgs{path: "/bin/bash"}, "/bin/bash:0x0"},
+		{probeArgs{path: "/bin/bash", offset: 1}, "/bin/bash:0x1"},
+		{probeArgs{path: "/bin/bash", offset: 65535}, "/bin/bash:0xffff"},
+		{probeArgs{path: "/bin/bash", offset: 65536}, "/bin/bash:0x10000"},
+		{probeArgs{path: "/bin/bash", offset: 1, refCtrOffset: 1}, "/bin/bash:0x1(0x1)"},
+		{probeArgs{path: "/bin/bash", offset: 1, refCtrOffset: 65535}, "/bin/bash:0x1(0xffff)"},
 	}
 
 	for i, tt := range tests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			po := uprobePathOffset(tt.path, tt.offset)
+			po := uprobeToken(tt.args)
 			if tt.expected != po {
 				t.Errorf("Expected path:offset to be '%s', got '%s'", tt.expected, po)
 			}
@@ -416,4 +453,8 @@ func TestUprobeProgramWrongPID(t *testing.T) {
 
 	// Assert that the value at index 0 is still 0.
 	assertMapValue(t, m, 0, 0)
+}
+
+func TestHaveRefCtrOffsetPMU(t *testing.T) {
+	testutils.CheckFeatureTest(t, haveRefCtrOffsetPMU)
 }

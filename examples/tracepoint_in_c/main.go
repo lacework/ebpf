@@ -9,34 +9,26 @@ package main
 
 import (
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang-11 Handler ./bpf/handler.c -- -nostdinc -I../headers
+// $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf tracepoint.c -- -I../headers
 
 const mapKey uint32 = 0
 
 func main() {
-
-	// Name of the kernel function to trace.
-	// Subscribe to signals for terminating the program.
-	stopper := make(chan os.Signal, 1)
-	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
-
 	// Allow the current process to lock memory for eBPF resources.
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal(err)
 	}
 
 	// Load pre-compiled programs and maps into the kernel.
-	objs := HandlerObjects{}
-	if err := LoadHandlerObjects(&objs, nil); err != nil {
+	objs := bpfObjects{}
+	if err := loadBpfObjects(&objs, nil); err != nil {
 		log.Fatalf("loading objects: %v", err)
 	}
 	defer objs.Close()
@@ -47,7 +39,7 @@ func main() {
 	// second.
 	// The first two arguments are taken from the following pathname:
 	// /sys/kernel/debug/tracing/events/kmem/mm_page_alloc
-	kp, err := link.Tracepoint("kmem", "mm_page_alloc", objs.MmPageAlloc)
+	kp, err := link.Tracepoint("kmem", "mm_page_alloc", objs.MmPageAlloc, nil)
 	if err != nil {
 		log.Fatalf("opening tracepoint: %s", err)
 	}
@@ -56,17 +48,14 @@ func main() {
 	// Read loop reporting the total amount of times the kernel
 	// function was entered, once per second.
 	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
 	log.Println("Waiting for events..")
-	for {
-		select {
-		case <-ticker.C:
-			var value uint64
-			if err := objs.CountingMap.Lookup(mapKey, &value); err != nil {
-				log.Fatalf("reading map: %v", err)
-			}
-			log.Printf("%v times\n", value)
-		case <-stopper:
-			return
+	for range ticker.C {
+		var value uint64
+		if err := objs.CountingMap.Lookup(mapKey, &value); err != nil {
+			log.Fatalf("reading map: %v", err)
 		}
+		log.Printf("%v times", value)
 	}
 }

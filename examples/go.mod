@@ -1,8 +1,8 @@
 module github.com/cilium/ebpf/examples
 
-go 1.16
+go 1.17
 
 require (
-	github.com/cilium/ebpf v0.6.3-0.20211001093841-41f3f37fcc9c
+	github.com/cilium/ebpf v0.8.2-0.20220424153111-6da9518107a8
 	golang.org/x/sys v0.0.0-20211001092434-39dca1131b70
 )
