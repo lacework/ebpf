@@ -29,6 +29,11 @@ func newInfoFromFd(fd *sys.FD) (*info, error) {
 		return nil, err
 	}
 
+	if btfInfo.NameLen > 0 {
+		// NameLen doesn't account for the terminating NUL.
+		btfInfo.NameLen++
+	}
+
 	btfBuffer := make([]byte, btfInfo.BtfSize)
 	nameBuffer := make([]byte, btfInfo.NameLen)
 	btfInfo.Btf, btfInfo.BtfSize = sys.NewSlicePointerLen(btfBuffer)
@@ -37,7 +42,7 @@ func newInfoFromFd(fd *sys.FD) (*info, error) {
 		return nil, err
 	}
 
-	spec, err := loadRawSpec(bytes.NewReader(btfBuffer), internal.NativeEndian, nil, nil)
+	spec, err := loadRawSpec(bytes.NewReader(btfBuffer), internal.NativeEndian)
 	if err != nil {
 		return nil, err
 	}
