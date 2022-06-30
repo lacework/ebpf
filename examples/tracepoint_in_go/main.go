@@ -3,7 +3,7 @@
 
 // This program demonstrates how to attach an eBPF program to a tracepoint.
 // The program is attached to the syscall/sys_enter_openat tracepoint and
-// prints out the integer 123 every time the sycall is entered.
+// prints out the integer 123 every time the syscall is entered.
 package main
 
 import (
@@ -99,7 +99,7 @@ func main() {
 	// Each time a userspace program uses the 'openat()' syscall, the eBPF
 	// program specified above will be executed and a '123' value will appear
 	// in the perf ring.
-	tp, err := link.Tracepoint("syscalls", "sys_enter_openat", prog)
+	tp, err := link.Tracepoint("syscalls", "sys_enter_openat", prog, nil)
 	if err != nil {
 		log.Fatalf("opening tracepoint: %s", err)
 	}

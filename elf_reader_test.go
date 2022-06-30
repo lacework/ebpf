@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal"
-	"github.com/cilium/ebpf/internal/btf"
 	"github.com/cilium/ebpf/internal/testutils"
 	"github.com/cilium/ebpf/internal/unix"
 
@@ -96,24 +96,46 @@ func TestLoadCollectionSpec(t *testing.T) {
 		},
 		Programs: map[string]*ProgramSpec{
 			"xdp_prog": {
-				Name:    "xdp_prog",
-				Type:    XDP,
-				License: "MIT",
+				Name:        "xdp_prog",
+				Type:        XDP,
+				SectionName: "xdp",
+				License:     "MIT",
 			},
 			"no_relocation": {
-				Name:    "no_relocation",
-				Type:    SocketFilter,
-				License: "MIT",
+				Name:        "no_relocation",
+				Type:        SocketFilter,
+				SectionName: "socket",
+				License:     "MIT",
 			},
 			"asm_relocation": {
-				Name:    "asm_relocation",
-				Type:    SocketFilter,
-				License: "MIT",
+				Name:        "asm_relocation",
+				Type:        SocketFilter,
+				SectionName: "socket/2",
+				License:     "MIT",
 			},
 			"data_sections": {
-				Name:    "data_sections",
-				Type:    SocketFilter,
-				License: "MIT",
+				Name:        "data_sections",
+				Type:        SocketFilter,
+				SectionName: "socket/3",
+				License:     "MIT",
+			},
+			"global_fn3": {
+				Name:        "global_fn3",
+				Type:        UnspecifiedProgram,
+				SectionName: "other",
+				License:     "MIT",
+			},
+			"static_fn": {
+				Name:        "static_fn",
+				Type:        UnspecifiedProgram,
+				SectionName: "static",
+				License:     "MIT",
+			},
+			"anon_const": {
+				Name:        "anon_const",
+				Type:        SocketFilter,
+				SectionName: "socket/4",
+				License:     "MIT",
 			},
 		},
 	}
@@ -126,17 +148,16 @@ func TestLoadCollectionSpec(t *testing.T) {
 			}
 			return false
 		}),
-		cmpopts.IgnoreTypes(new(btf.Map), new(btf.Program)),
-		cmpopts.IgnoreFields(CollectionSpec{}, "ByteOrder"),
+		cmpopts.IgnoreTypes(new(btf.Spec)),
+		cmpopts.IgnoreFields(CollectionSpec{}, "ByteOrder", "Types"),
 		cmpopts.IgnoreFields(ProgramSpec{}, "Instructions", "ByteOrder"),
+		cmpopts.IgnoreFields(MapSpec{}, "Key", "Value"),
+		cmpopts.IgnoreUnexported(ProgramSpec{}),
 		cmpopts.IgnoreMapEntries(func(key string, _ *MapSpec) bool {
-			switch key {
-			case ".bss", ".data", ".rodata":
+			if key == ".bss" || key == ".data" || strings.HasPrefix(key, ".rodata") {
 				return true
-
-			default:
-				return false
 			}
+			return false
 		}),
 	}
 
@@ -153,9 +174,10 @@ func TestLoadCollectionSpec(t *testing.T) {
 		}
 
 		opts := defaultOpts
-		if have.Maps[".rodata"] != nil {
+		if have.Types != nil {
 			err := have.RewriteConstants(map[string]interface{}{
-				"arg": uint32(1),
+				"arg":  uint32(1),
+				"arg2": uint32(2),
 			})
 			if err != nil {
 				t.Fatal("Can't rewrite constant:", err)
@@ -199,10 +221,18 @@ func TestLoadCollectionSpec(t *testing.T) {
 			t.Fatal("Can't run program:", err)
 		}
 
-		if ret != 5 {
+		if ret != 7 {
 			t.Error("Expected return value to be 5, got", ret)
 		}
 	})
+}
+
+func BenchmarkELFLoader(b *testing.B) {
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, _ = LoadCollectionSpec("testdata/loader-el.elf")
+	}
 }
 
 func TestDataSections(t *testing.T) {
@@ -243,7 +273,7 @@ func TestInlineASMConstant(t *testing.T) {
 	}
 
 	spec := coll.Programs["asm_relocation"]
-	if spec.Instructions[0].Reference != "MY_CONST" {
+	if spec.Instructions[0].Reference() != "MY_CONST" {
 		t.Fatal("First instruction is not a reference to MY_CONST")
 	}
 
@@ -346,8 +376,12 @@ func TestLoadInitializedBTFMap(t *testing.T) {
 				t.Errorf("expecting MapSpec entry Key to equal 1, got %v", p.Key)
 			}
 
-			if _, ok := p.Value.(programStub); !ok {
-				t.Errorf("expecting MapSpec entry Value to be of type programStub, got %T", p.Value)
+			if _, ok := p.Value.(string); !ok {
+				t.Errorf("expecting MapSpec entry Value to be a string, got %T", p.Value)
+			}
+
+			if p.Value != "tail_1" {
+				t.Errorf("expected MapSpec entry Value 'tail_1', got: %s", p.Value)
 			}
 		})
 
@@ -366,8 +400,12 @@ func TestLoadInitializedBTFMap(t *testing.T) {
 				t.Errorf("expecting MapSpec entry Key to equal 1, got %v", p.Key)
 			}
 
-			if _, ok := p.Value.(mapStub); !ok {
-				t.Errorf("expecting MapSpec entry Value to be of type mapStub, got %T", p.Value)
+			if _, ok := p.Value.(string); !ok {
+				t.Errorf("expecting MapSpec entry Value to be a string, got %T", p.Value)
+			}
+
+			if p.Value != "inner_map" {
+				t.Errorf("expected MapSpec entry Value 'inner_map', got: %s", p.Value)
 			}
 		})
 	})
@@ -456,6 +494,43 @@ func TestTailCall(t *testing.T) {
 	})
 }
 
+func TestSubprogRelocation(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.13", "bpf_for_each_map_elem")
+
+	testutils.Files(t, testutils.Glob(t, "testdata/subprog_reloc-*.elf"), func(t *testing.T, file string) {
+		spec, err := LoadCollectionSpec(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if spec.ByteOrder != internal.NativeEndian {
+			return
+		}
+
+		var obj struct {
+			Main    *Program `ebpf:"fp_relocation"`
+			HashMap *Map     `ebpf:"hash_map"`
+		}
+
+		err = spec.LoadAndAssign(&obj, nil)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer obj.Main.Close()
+
+		ret, _, err := obj.Main.Test(make([]byte, 14))
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if ret != 42 {
+			t.Fatalf("Expected subprog reloc to return value 42, got %d", ret)
+		}
+	})
+}
+
 func TestUnassignedProgArray(t *testing.T) {
 	testutils.Files(t, testutils.Glob(t, "testdata/btf_map_init-*.elf"), func(t *testing.T, file string) {
 		spec, err := LoadCollectionSpec(file)
@@ -503,14 +578,18 @@ func TestIPRoute2Compat(t *testing.T) {
 
 		var id, pinning, innerID, innerIndex uint32
 
+		if ms.Extra == nil {
+			t.Fatal("missing extra bytes")
+		}
+
 		switch {
-		case binary.Read(&ms.Extra, spec.ByteOrder, &id) != nil:
+		case binary.Read(ms.Extra, spec.ByteOrder, &id) != nil:
 			t.Fatal("missing id")
-		case binary.Read(&ms.Extra, spec.ByteOrder, &pinning) != nil:
+		case binary.Read(ms.Extra, spec.ByteOrder, &pinning) != nil:
 			t.Fatal("missing pinning")
-		case binary.Read(&ms.Extra, spec.ByteOrder, &innerID) != nil:
+		case binary.Read(ms.Extra, spec.ByteOrder, &innerID) != nil:
 			t.Fatal("missing inner_id")
-		case binary.Read(&ms.Extra, spec.ByteOrder, &innerIndex) != nil:
+		case binary.Read(ms.Extra, spec.ByteOrder, &innerIndex) != nil:
 			t.Fatal("missing inner_idx")
 		}
 
@@ -599,12 +678,15 @@ func TestLibBPFCompat(t *testing.T) {
 	testutils.Files(t, files, func(t *testing.T, path string) {
 		file := filepath.Base(path)
 		switch file {
-		case "test_sk_assign.o":
-			t.Skip("Skipping due to incompatible struct bpf_map_def")
-		case "test_map_in_map.o", "test_select_reuseport_kern.o":
+		case "test_map_in_map.o", "test_map_in_map.linked3.o",
+			"test_select_reuseport_kern.o", "test_select_reuseport_kern.linked3.o":
 			t.Skip("Skipping due to missing InnerMap in map definition")
 		case "test_core_autosize.o":
 			t.Skip("Skipping since the test generates dynamic BTF")
+		case "test_static_linked.linked3.o":
+			t.Skip("Skipping since .text contains 'subprog' twice")
+		case "linked_maps.linked3.o", "linked_funcs.linked3.o":
+			t.Skip("Skipping since weak relocations are not supported")
 		}
 
 		t.Parallel()
@@ -613,6 +695,17 @@ func TestLibBPFCompat(t *testing.T) {
 		testutils.SkipIfNotSupported(t, err)
 		if err != nil {
 			t.Fatalf("Can't read %s: %s", file, err)
+		}
+
+		switch file {
+		case "test_sk_assign.o":
+			// Test contains a legacy iproute2 bpf_elf_map definition.
+			for _, m := range spec.Maps {
+				if m.Extra == nil || m.Extra.Len() == 0 {
+					t.Fatalf("Expected extra bytes in map %s", m.Name)
+				}
+				m.Extra = nil
+			}
 		}
 
 		var opts CollectionOptions
@@ -659,6 +752,9 @@ func TestLibBPFCompat(t *testing.T) {
 				case "btf__core_reloc_type_id___missing_targets.o",
 					"btf__core_reloc_flavors__err_wrong_name.o":
 					valid = false
+				case "btf__core_reloc_ints___err_bitfield.o":
+					// Bitfields are now valid.
+					valid = true
 				default:
 					valid = !strings.Contains(name, "___err_")
 				}
@@ -669,8 +765,13 @@ func TestLibBPFCompat(t *testing.T) {
 				}
 				defer fh.Close()
 
+				btfSpec, err := btf.LoadSpec(coreFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+
 				opts := opts // copy
-				opts.Programs.TargetBTF = fh
+				opts.Programs.KernelTypes = btfSpec
 				load(t, spec, opts, valid)
 			})
 		}
@@ -754,6 +855,11 @@ func TestGetProgType(t *testing.T) {
 			At: AttachNone,
 			To: "",
 		},
+		"xdp_devmap/foo": {
+			Pt: XDP,
+			At: AttachXDPDevMap,
+			To: "foo",
+		},
 		"cgroup_skb/ingress": {
 			Pt: CGroupSKB,
 			At: AttachCGroupInetIngress,
@@ -774,6 +880,16 @@ func TestGetProgType(t *testing.T) {
 			Pt: LSM,
 			At: AttachLSMMac,
 			To: "file_ioctl",
+		},
+		"sk_skb/stream_verdict/foo": {
+			Pt: SkSKB,
+			At: AttachSkSKBStreamVerdict,
+			To: "",
+		},
+		"sk_skb/bar": {
+			Pt: SkSKB,
+			At: AttachNone,
+			To: "",
 		},
 	}
 

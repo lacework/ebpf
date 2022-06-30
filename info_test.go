@@ -8,6 +8,7 @@ import (
 
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/internal"
+	"github.com/cilium/ebpf/internal/sys"
 	"github.com/cilium/ebpf/internal/testutils"
 	"github.com/cilium/ebpf/internal/unix"
 	qt "github.com/frankban/quicktest"
@@ -22,12 +23,14 @@ func TestMapInfoFromProc(t *testing.T) {
 		MaxEntries: 2,
 		Flags:      unix.BPF_F_NO_PREALLOC,
 	})
+	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer hash.Close()
 
 	info, err := newMapInfoFromProc(hash.fd)
+	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
 		t.Fatal("Can't get map info:", err)
 	}
@@ -84,10 +87,9 @@ func TestMapInfoFromProc(t *testing.T) {
 }
 
 func TestProgramInfo(t *testing.T) {
-	prog := createSocketFilter(t)
-	defer prog.Close()
+	prog := mustSocketFilter(t)
 
-	for name, fn := range map[string]func(*internal.FD) (*ProgramInfo, error){
+	for name, fn := range map[string]func(*sys.FD) (*ProgramInfo, error){
 		"generic": newProgramInfoFromFd,
 		"proc":    newProgramInfoFromProc,
 	} {
@@ -192,20 +194,7 @@ func TestScanFdInfoReader(t *testing.T) {
 func TestStats(t *testing.T) {
 	testutils.SkipOnOldKernel(t, "5.8", "BPF_ENABLE_STATS")
 
-	spec := &ProgramSpec{
-		Type: SocketFilter,
-		Instructions: asm.Instructions{
-			asm.LoadImm(asm.R0, 42, asm.DWord),
-			asm.Return(),
-		},
-		License: "MIT",
-	}
-
-	prog, err := NewProgram(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer prog.Close()
+	prog := mustSocketFilter(t)
 
 	pi, err := prog.Info()
 	if err != nil {
@@ -237,21 +226,7 @@ func TestStats(t *testing.T) {
 func BenchmarkStats(b *testing.B) {
 	testutils.SkipOnOldKernel(b, "5.8", "BPF_ENABLE_STATS")
 
-	spec := &ProgramSpec{
-		Type: SocketFilter,
-		Instructions: asm.Instructions{
-			asm.LoadImm(asm.R0, 42, asm.DWord),
-			asm.Return(),
-		},
-		License: "MIT",
-	}
-
-	// Don't insert the program in a loop as it causes a flood of kaudit messages.
-	prog, err := NewProgram(spec)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer prog.Close()
+	prog := mustSocketFilter(b)
 
 	for n := 0; n < b.N; n++ {
 		if err := testStats(prog); err != nil {

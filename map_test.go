@@ -12,8 +12,9 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal"
-	"github.com/cilium/ebpf/internal/btf"
+	"github.com/cilium/ebpf/internal/sys"
 	"github.com/cilium/ebpf/internal/testutils"
 	"github.com/cilium/ebpf/internal/unix"
 
@@ -268,13 +269,132 @@ func TestMapClose(t *testing.T) {
 		t.Fatal("Can't close map:", err)
 	}
 
-	if err := m.Put(uint32(0), uint32(42)); !errors.Is(err, internal.ErrClosedFd) {
+	if err := m.Put(uint32(0), uint32(42)); !errors.Is(err, sys.ErrClosedFd) {
 		t.Fatal("Put doesn't check for closed fd", err)
 	}
 
-	if _, err := m.LookupBytes(uint32(0)); !errors.Is(err, internal.ErrClosedFd) {
+	if _, err := m.LookupBytes(uint32(0)); !errors.Is(err, sys.ErrClosedFd) {
 		t.Fatal("Get doesn't check for closed fd", err)
 	}
+}
+
+func TestBatchMapWithLock(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.13", "MAP BATCH BPF_F_LOCK")
+	testutils.Files(t, testutils.Glob(t, "./testdata/map_spin_lock-*.elf"), func(t *testing.T, file string) {
+		spec, err := LoadCollectionSpec(file)
+		if err != nil {
+			t.Fatal("Can't parse ELF:", err)
+		}
+		if spec.ByteOrder != internal.NativeEndian {
+			return
+		}
+
+		coll, err := NewCollection(spec)
+		if err != nil {
+			t.Fatal("Can't parse ELF:", err)
+		}
+
+		type spinLockValue struct {
+			Cnt     uint32
+			Padding uint32
+		}
+
+		m, ok := coll.Maps["spin_lock_map"]
+		if !ok {
+			t.Fatal(err)
+		}
+
+		keys := []uint32{0, 1}
+		values := []spinLockValue{{Cnt: 42}, {Cnt: 4242}}
+		count, err := m.BatchUpdate(keys, values, &BatchOptions{ElemFlags: uint64(UpdateLock)})
+		if err != nil {
+			t.Fatalf("BatchUpdate: %v", err)
+		}
+		if count != len(keys) {
+			t.Fatalf("BatchUpdate: expected count, %d, to be %d", count, len(keys))
+		}
+
+		nextKey := uint32(0)
+		lookupKeys := make([]uint32, 2)
+		lookupValues := make([]spinLockValue, 2)
+		count, err = m.BatchLookup(nil, &nextKey, lookupKeys, lookupValues, &BatchOptions{ElemFlags: uint64(LookupLock)})
+		if !errors.Is(err, ErrKeyNotExist) {
+			t.Fatalf("BatchLookup: %v", err)
+		}
+		if count != 2 {
+			t.Fatalf("BatchLookup: expected two keys, got %d", count)
+		}
+
+		nextKey = uint32(0)
+		deleteKeys := []uint32{0, 1}
+		deleteValues := make([]spinLockValue, 2)
+		count, err = m.BatchLookupAndDelete(nil, &nextKey, deleteKeys, deleteValues, nil)
+		if !errors.Is(err, ErrKeyNotExist) {
+			t.Fatalf("BatchLookupAndDelete: %v", err)
+		}
+		if count != 2 {
+			t.Fatalf("BatchLookupAndDelete: expected two keys, got %d", count)
+		}
+	})
+}
+
+func TestMapWithLock(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.13", "MAP BPF_F_LOCK")
+	testutils.Files(t, testutils.Glob(t, "./testdata/map_spin_lock-*.elf"), func(t *testing.T, file string) {
+		spec, err := LoadCollectionSpec(file)
+		if err != nil {
+			t.Fatal("Can't parse ELF:", err)
+		}
+		if spec.ByteOrder != internal.NativeEndian {
+			return
+		}
+
+		coll, err := NewCollection(spec)
+		if err != nil {
+			t.Fatal("Can't parse ELF:", err)
+		}
+
+		type spinLockValue struct {
+			Cnt     uint32
+			Padding uint32
+		}
+
+		m, ok := coll.Maps["spin_lock_map"]
+		if !ok {
+			t.Fatal(err)
+		}
+
+		key := uint32(1)
+		value := spinLockValue{Cnt: 5}
+		err = m.Update(key, value, UpdateLock)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		value.Cnt = 0
+		err = m.LookupWithFlags(&key, &value, LookupLock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value.Cnt != 5 {
+			t.Fatalf("Want value 5, got %d", value.Cnt)
+		}
+
+		value.Cnt = 0
+		err = m.LookupAndDeleteWithFlags(&key, &value, LookupLock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value.Cnt != 5 {
+			t.Fatalf("Want value 5, got %d", value.Cnt)
+		}
+
+		err = m.LookupWithFlags(&key, &value, LookupLock)
+		if err != nil && !errors.Is(err, ErrKeyNotExist) {
+			t.Fatal(err)
+		}
+
+	})
 }
 
 func TestMapCloneNil(t *testing.T) {
@@ -301,15 +421,17 @@ func TestMapPin(t *testing.T) {
 	path := filepath.Join(tmp, "map")
 
 	if err := m.Pin(path); err != nil {
+		testutils.SkipIfNotSupported(t, err)
 		t.Fatal(err)
 	}
 
 	pinned := m.IsPinned()
-	c.Assert(pinned, qt.Equals, true)
+	c.Assert(pinned, qt.IsTrue)
 
 	m.Close()
 
 	m, err := LoadPinnedMap(path, nil)
+	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,6 +478,7 @@ func TestNestedMapPin(t *testing.T) {
 	m.Close()
 
 	m, err = LoadPinnedMap(path, nil)
+	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,6 +505,8 @@ func TestNestedMapPinNested(t *testing.T) {
 }
 
 func TestMapPinMultiple(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "4.9", "atomic re-pinning was introduced in 4.9 series")
+
 	tmp := testutils.TempBPFFS(t)
 	c := qt.New(t)
 
@@ -393,10 +518,11 @@ func TestMapPinMultiple(t *testing.T) {
 	}
 	defer m1.Close()
 	pinned := m1.IsPinned()
-	c.Assert(pinned, qt.Equals, true)
+	c.Assert(pinned, qt.IsTrue)
 
 	newPath := filepath.Join(tmp, "bar")
 	err = m1.Pin(newPath)
+	testutils.SkipIfNotSupported(t, err)
 	c.Assert(err, qt.IsNil)
 	oldPath := filepath.Join(tmp, spec.Name)
 	if _, err := os.Stat(oldPath); err == nil {
@@ -404,6 +530,8 @@ func TestMapPinMultiple(t *testing.T) {
 	}
 	m2, err := LoadPinnedMap(newPath, nil)
 	c.Assert(err, qt.IsNil)
+	pinned = m2.IsPinned()
+	c.Assert(pinned, qt.IsTrue)
 	defer m2.Close()
 }
 
@@ -434,7 +562,7 @@ func TestMapPinFailReplace(t *testing.T) {
 		t.Fatal("Failed to create map2:", err)
 	}
 	defer m2.Close()
-	c.Assert(m.IsPinned(), qt.Equals, true)
+	c.Assert(m.IsPinned(), qt.IsTrue)
 	newPath := filepath.Join(tmp, spec2.Name)
 
 	c.Assert(m.Pin(newPath), qt.Not(qt.IsNil), qt.Commentf("Pin didn't"+
@@ -453,9 +581,10 @@ func TestMapUnpin(t *testing.T) {
 	defer m.Close()
 
 	pinned := m.IsPinned()
-	c.Assert(pinned, qt.Equals, true)
+	c.Assert(pinned, qt.IsTrue)
 	path := filepath.Join(tmp, spec.Name)
 	m2, err := LoadPinnedMap(path, nil)
+	testutils.SkipIfNotSupported(t, err)
 	c.Assert(err, qt.IsNil)
 	defer m2.Close()
 
@@ -477,14 +606,15 @@ func TestMapLoadPinned(t *testing.T) {
 	c.Assert(err, qt.IsNil)
 	defer m1.Close()
 	pinned := m1.IsPinned()
-	c.Assert(pinned, qt.Equals, true)
+	c.Assert(pinned, qt.IsTrue)
 
 	path := filepath.Join(tmp, spec.Name)
 	m2, err := LoadPinnedMap(path, nil)
+	testutils.SkipIfNotSupported(t, err)
 	c.Assert(err, qt.IsNil)
 	defer m2.Close()
 	pinned = m2.IsPinned()
-	c.Assert(pinned, qt.Equals, true)
+	c.Assert(pinned, qt.IsTrue)
 }
 
 func TestMapLoadPinnedUnpin(t *testing.T) {
@@ -497,10 +627,11 @@ func TestMapLoadPinnedUnpin(t *testing.T) {
 	c.Assert(err, qt.IsNil)
 	defer m1.Close()
 	pinned := m1.IsPinned()
-	c.Assert(pinned, qt.Equals, true)
+	c.Assert(pinned, qt.IsTrue)
 
 	path := filepath.Join(tmp, spec.Name)
 	m2, err := LoadPinnedMap(path, nil)
+	testutils.SkipIfNotSupported(t, err)
 	c.Assert(err, qt.IsNil)
 	defer m2.Close()
 	err = m1.Unpin()
@@ -511,7 +642,7 @@ func TestMapLoadPinnedUnpin(t *testing.T) {
 
 func TestMapLoadPinnedWithOptions(t *testing.T) {
 	// Introduced in commit 6e71b04a8224.
-	testutils.SkipOnOldKernel(t, "4.14", "file_flags in BPF_OBJ_GET")
+	testutils.SkipOnOldKernel(t, "4.15", "file_flags in BPF_OBJ_GET")
 
 	array := createArray(t)
 	defer array.Close()
@@ -909,6 +1040,143 @@ func TestMapIterate(t *testing.T) {
 	}
 }
 
+func TestMapIterateHashKeyOneByteFull(t *testing.T) {
+	hash, err := NewMap(&MapSpec{
+		Type:       Hash,
+		KeySize:    1,
+		ValueSize:  1,
+		MaxEntries: 256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hash.Close()
+
+	for i := 0; i < int(hash.MaxEntries()); i++ {
+		if err := hash.Put(uint8(i), uint8(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var key uint8
+	var value uint8
+	var keys int
+
+	entries := hash.Iterate()
+	for entries.Next(&key, &value) {
+		if key != value {
+			t.Fatalf("Expected key == value, got key %v value %v", key, value)
+		}
+		keys++
+	}
+
+	if err := entries.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	if keys != int(hash.MaxEntries()) {
+		t.Fatalf("Expected to get %d keys, have %d", hash.MaxEntries(), keys)
+	}
+}
+
+func TestMapGuessNonExistentKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		mapType MapType
+		keys    []uint32
+	}{
+		{
+			"empty", Hash, []uint32{},
+		},
+		{
+			"all zero key", Hash, []uint32{0},
+		},
+		{
+			"all ones key", Hash, []uint32{math.MaxUint32},
+		},
+		{
+			"alternating bits key", Hash, []uint32{0x5555_5555},
+		},
+		{
+			"all special patterns", Hash, []uint32{0, math.MaxUint32, 0x5555_5555},
+		},
+		{
+			"empty", Array, []uint32{},
+		},
+		{
+			"all zero key", Array, []uint32{0},
+		},
+		{
+			"full", Array, []uint32{0, 1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s: %s", tt.mapType, tt.name), func(t *testing.T) {
+			maxEntries := uint32(len(tt.keys))
+			if maxEntries == 0 {
+				maxEntries = 1
+			}
+
+			m, err := NewMap(&MapSpec{
+				Type:       tt.mapType,
+				KeySize:    4,
+				ValueSize:  4,
+				MaxEntries: maxEntries,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+
+			for _, key := range tt.keys {
+				if err := m.Put(key, key); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			guess, err := m.guessNonExistentKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(guess) != int(m.keySize) {
+				t.Fatal("Guessed key has wrong size")
+			}
+
+			var value uint32
+			if err := m.Lookup(guess, &value); !errors.Is(err, unix.ENOENT) {
+				t.Fatal("Doesn't return ENOENT:", err)
+			}
+		})
+	}
+
+	t.Run("Hash: full", func(t *testing.T) {
+		const n = math.MaxUint8 + 1
+
+		hash, err := NewMap(&MapSpec{
+			Type:       Hash,
+			KeySize:    1,
+			ValueSize:  1,
+			MaxEntries: n,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer hash.Close()
+
+		for i := 0; i < n; i++ {
+			if err := hash.Put(uint8(i), uint8(i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		_, err = hash.guessNonExistentKey()
+		if err == nil {
+			t.Fatal("guessNonExistentKey doesn't return error on full hash table")
+		}
+	})
+}
+
 func TestNotExist(t *testing.T) {
 	hash := createHash()
 	defer hash.Close()
@@ -928,11 +1196,16 @@ func TestNotExist(t *testing.T) {
 	}
 
 	if err := hash.Delete("hello"); !errors.Is(err, ErrKeyNotExist) {
-		t.Error("Deleting unknown key doesn't return ErrKeyNotExist")
+		t.Error("Deleting unknown key doesn't return ErrKeyNotExist", err)
+	}
+
+	var k = []byte{1, 2, 3, 4, 5}
+	if err := hash.NextKey(&k, &tmp); !errors.Is(err, ErrKeyNotExist) {
+		t.Error("Looking up next key in empty map doesn't return a non-existing error", err)
 	}
 
 	if err := hash.NextKey(nil, &tmp); !errors.Is(err, ErrKeyNotExist) {
-		t.Error("Looking up next key in empty map doesn't return a non-existing error")
+		t.Error("Looking up next key in empty map doesn't return a non-existing error", err)
 	}
 }
 
@@ -991,6 +1264,9 @@ func TestPerCPUMarshaling(t *testing.T) {
 			}
 			if numCPU < 2 {
 				t.Skip("Test requires at least two CPUs")
+			}
+			if typ == PerCPUHash || typ == PerCPUArray {
+				testutils.SkipOnOldKernel(t, "4.6", "per-CPU hash and array")
 			}
 			if typ == LRUCPUHash {
 				testutils.SkipOnOldKernel(t, "4.10", "LRU per-CPU hash")
@@ -1080,24 +1356,24 @@ func TestCgroupPerCPUStorageMarshaling(t *testing.T) {
 	}
 	defer prog.Close()
 
-	progAttachAttrs := internal.BPFProgAttachAttr{
+	progAttachAttrs := sys.ProgAttachAttr{
 		TargetFd:     uint32(cgroup.Fd()),
 		AttachBpfFd:  uint32(prog.FD()),
 		AttachType:   uint32(AttachCGroupInetEgress),
 		AttachFlags:  0,
 		ReplaceBpfFd: 0,
 	}
-	err = internal.BPFProgAttach(&progAttachAttrs)
+	err = sys.ProgAttach(&progAttachAttrs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
-		attr := internal.BPFProgDetachAttr{
+		attr := sys.ProgDetachAttr{
 			TargetFd:    uint32(cgroup.Fd()),
 			AttachBpfFd: uint32(prog.FD()),
 			AttachType:  uint32(AttachCGroupInetEgress),
 		}
-		if err := internal.BPFProgDetach(&attr); err != nil {
+		if err := sys.ProgDetach(&attr); err != nil {
 			t.Fatal(err)
 		}
 	}()
@@ -1194,12 +1470,12 @@ func TestMapName(t *testing.T) {
 	}
 	defer m.Close()
 
-	info, err := bpfGetMapInfoByFD(m.fd)
-	if err != nil {
+	var info sys.MapInfo
+	if err := sys.ObjInfo(m.fd, &info); err != nil {
 		t.Fatal(err)
 	}
 
-	if name := internal.CString(info.name[:]); name != "test" {
+	if name := unix.ByteSliceToString(info.Name[:]); name != "test" {
 		t.Error("Expected name to be test, got", name)
 	}
 }
@@ -1215,6 +1491,7 @@ func TestMapFromFD(t *testing.T) {
 	// If you're thinking about copying this, don't. Use
 	// Clone() instead.
 	m2, err := NewMapFromFD(m.FD())
+	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1313,7 +1590,7 @@ func TestMapGetNextID(t *testing.T) {
 	for {
 		last := next
 		if next, err = MapGetNextID(last); err != nil {
-			if !errors.Is(err, ErrNotExist) {
+			if !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("Expected ErrNotExist, got:", err)
 			}
 			break
@@ -1325,25 +1602,29 @@ func TestMapGetNextID(t *testing.T) {
 }
 
 func TestNewMapFromID(t *testing.T) {
-	testutils.SkipOnOldKernel(t, "4.13", "bpf_map_get_fd_by_id")
-
 	hash := createHash()
 	defer hash.Close()
-	var next MapID
-	var err error
 
-	next, err = hash.ID()
+	info, err := hash.Info()
+	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
-		t.Fatal("Could not get ID of map:", err)
+		t.Fatal("Couldn't get map info:", err)
 	}
 
-	if _, err = NewMapFromID(next); err != nil {
-		t.Fatalf("Can't get map for ID %d: %v", uint32(next), err)
+	id, ok := info.ID()
+	if !ok {
+		t.Skip("Map ID not supported")
 	}
+
+	hash2, err := NewMapFromID(id)
+	if err != nil {
+		t.Fatalf("Can't get map for ID %d: %v", id, err)
+	}
+	hash2.Close()
 
 	// As there can be multiple maps, we use max(uint32) as MapID to trigger an expected error.
 	_, err = NewMapFromID(MapID(math.MaxUint32))
-	if !errors.Is(err, ErrNotExist) {
+	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("Expected ErrNotExist, got:", err)
 	}
 }
@@ -1367,7 +1648,7 @@ func TestMapPinning(t *testing.T) {
 	}
 	defer m1.Close()
 	pinned := m1.IsPinned()
-	c.Assert(pinned, qt.Equals, true)
+	c.Assert(pinned, qt.IsTrue)
 
 	if err := m1.Put(uint32(0), uint32(42)); err != nil {
 		t.Fatal("Can't write value:", err)
@@ -1376,9 +1657,10 @@ func TestMapPinning(t *testing.T) {
 	// This is a terrible hack: if loading a pinned map tries to load BTF,
 	// it will get a nil *btf.Spec from this *btf.Map. This is turn will make
 	// btf.NewHandle fail.
-	spec.BTF = new(btf.Map)
+	spec.BTF = new(btf.Spec)
 
 	m2, err := NewMapWithOptions(spec, MapOptions{PinPath: tmp})
+	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
 		t.Fatal("Can't create map:", err)
 	}
