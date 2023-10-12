@@ -146,7 +146,7 @@ func TestInstructionLoadMapValue(t *testing.T) {
 		t.Error("Expected map fd to be 1, got", fd)
 	}
 	if off := ins.mapOffset(); off != 123 {
-		t.Fatal("Expected map offset to be 123 after changin the pointer, got", off)
+		t.Fatal("Expected map offset to be 123 after changing the pointer, got", off)
 	}
 }
 
@@ -174,6 +174,19 @@ func TestInstructionsRewriteMapPtr(t *testing.T) {
 
 	if err := insns.RewriteMapPtr("bad", 1); !errors.Is(err, ErrUnreferencedSymbol) {
 		t.Error("Rewriting unreferenced map doesn't return appropriate error")
+	}
+}
+
+func TestInstructionWithMetadata(t *testing.T) {
+	ins := LoadImm(R0, 123, DWord).WithSymbol("abc")
+	ins2 := LoadImm(R0, 567, DWord).WithMetadata(ins.Metadata)
+
+	if want, got := "abc", ins2.Symbol(); want != got {
+		t.Fatalf("unexpected Symbol value on ins2: want: %s, got: %s", want, got)
+	}
+
+	if want, got := ins.Metadata, ins2.Metadata; want != got {
+		t.Fatal("expected ins and isn2 Metadata to match")
 	}
 }
 

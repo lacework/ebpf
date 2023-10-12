@@ -1,6 +1,3 @@
-//go:build linux
-// +build linux
-
 // This program demonstrates attaching an eBPF program to a kernel symbol and
 // using percpu map to collect data. The eBPF program will be attached to the
 // start of the sys_execve kernel function and prints out the number of called
@@ -15,8 +12,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-// $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf kprobe_percpu.c -- -I../headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf kprobe_percpu.c -- -I../headers
 
 const mapKey uint32 = 0
 

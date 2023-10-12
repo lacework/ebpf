@@ -35,6 +35,29 @@ func TestSizeof(t *testing.T) {
 	}
 }
 
+func TestPow(t *testing.T) {
+	tests := []struct {
+		n int
+		r bool
+	}{
+		{0, false},
+		{1, true},
+		{2, true},
+		{3, false},
+		{4, true},
+		{5, false},
+		{8, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%d", tt.n), func(t *testing.T) {
+			if want, got := tt.r, pow(tt.n); want != got {
+				t.Errorf("unexpected result for n %d; want: %v, got: %v", tt.n, want, got)
+			}
+		})
+	}
+}
+
 func TestCopy(t *testing.T) {
 	_ = Copy((*Void)(nil), nil)
 
@@ -63,6 +86,41 @@ func TestCopy(t *testing.T) {
 		outStruct := out.(*Struct)
 		qt.Assert(t, outStruct.Members[0].Type, qt.Equals, outStruct.Members[1].Type)
 	})
+}
+
+func TestAs(t *testing.T) {
+	i := &Int{}
+	ptr := &Pointer{i}
+	td := &Typedef{Type: ptr}
+	cst := &Const{td}
+	vol := &Volatile{cst}
+
+	// It's possible to retrieve qualifiers and Typedefs.
+	haveVol, ok := as[*Volatile](vol)
+	qt.Assert(t, ok, qt.IsTrue)
+	qt.Assert(t, haveVol, qt.Equals, vol)
+
+	haveTd, ok := as[*Typedef](vol)
+	qt.Assert(t, ok, qt.IsTrue)
+	qt.Assert(t, haveTd, qt.Equals, td)
+
+	haveCst, ok := as[*Const](vol)
+	qt.Assert(t, ok, qt.IsTrue)
+	qt.Assert(t, haveCst, qt.Equals, cst)
+
+	// Make sure we don't skip Pointer.
+	haveI, ok := as[*Int](vol)
+	qt.Assert(t, ok, qt.IsFalse)
+	qt.Assert(t, haveI, qt.IsNil)
+
+	// Make sure we can always retrieve Pointer.
+	for _, typ := range []Type{
+		td, cst, vol, ptr,
+	} {
+		have, ok := as[*Pointer](typ)
+		qt.Assert(t, ok, qt.IsTrue)
+		qt.Assert(t, have, qt.Equals, ptr)
+	}
 }
 
 func BenchmarkCopy(b *testing.B) {
@@ -97,6 +155,7 @@ func ExampleType_validTypes() {
 	var _ Type = &FuncProto{}
 	var _ Type = &Var{}
 	var _ Type = &Datasec{}
+	var _ Type = &Float{}
 }
 
 func TestType(t *testing.T) {
@@ -134,6 +193,9 @@ func TestType(t *testing.T) {
 				Vars: []VarSecinfo{{Type: &Void{}}},
 			}
 		},
+		func() Type { return &Float{} },
+		func() Type { return &declTag{Type: &Void{}} },
+		func() Type { return &typeTag{Type: &Void{}} },
 		func() Type { return &cycle{&Void{}} },
 	}
 
@@ -150,91 +212,59 @@ func TestType(t *testing.T) {
 				t.Error("Copy doesn't copy")
 			}
 
-			var first, second typeDeque
-			typ.walk(&first)
-			typ.walk(&second)
+			var a []*Type
+			walkType(typ, func(t *Type) { a = append(a, t) })
 
-			if diff := cmp.Diff(first.all(), second.all(), compareTypes); diff != "" {
+			if _, ok := typ.(*cycle); !ok {
+				if n := countChildren(t, reflect.TypeOf(typ)); len(a) < n {
+					t.Errorf("walkType visited %d children, expected at least %d", len(a), n)
+				}
+			}
+
+			var b []*Type
+			walkType(typ, func(t *Type) { b = append(b, t) })
+
+			if diff := cmp.Diff(a, b, compareTypes); diff != "" {
 				t.Errorf("Walk mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
 }
 
-func TestTypeDeque(t *testing.T) {
-	a, b := new(Type), new(Type)
+func TestTagMarshaling(t *testing.T) {
+	for _, typ := range []Type{
+		&declTag{&Struct{Members: []Member{}}, "foo", -1},
+		&typeTag{&Int{}, "foo"},
+	} {
+		t.Run(fmt.Sprint(typ), func(t *testing.T) {
+			s := specFromTypes(t, []Type{typ})
 
-	t.Run("pop", func(t *testing.T) {
-		var td typeDeque
-		td.push(a)
-		td.push(b)
+			have, err := s.TypeByID(1)
+			qt.Assert(t, err, qt.IsNil)
 
-		if td.pop() != b {
-			t.Error("Didn't pop b first")
+			qt.Assert(t, have, qt.DeepEquals, typ)
+		})
+	}
+}
+
+func countChildren(t *testing.T, typ reflect.Type) int {
+	if typ.Kind() != reflect.Pointer {
+		t.Fatal("Expected pointer, got", typ.Kind())
+	}
+
+	typ = typ.Elem()
+	if typ.Kind() != reflect.Struct {
+		t.Fatal("Expected struct, got", typ.Kind())
+	}
+
+	var n int
+	for i := 0; i < typ.NumField(); i++ {
+		if typ.Field(i).Type == reflect.TypeOf((*Type)(nil)).Elem() {
+			n++
 		}
+	}
 
-		if td.pop() != a {
-			t.Error("Didn't pop a second")
-		}
-
-		if td.pop() != nil {
-			t.Error("Didn't pop nil")
-		}
-	})
-
-	t.Run("shift", func(t *testing.T) {
-		var td typeDeque
-		td.push(a)
-		td.push(b)
-
-		if td.shift() != a {
-			t.Error("Didn't shift a second")
-		}
-
-		if td.shift() != b {
-			t.Error("Didn't shift b first")
-		}
-
-		if td.shift() != nil {
-			t.Error("Didn't shift nil")
-		}
-	})
-
-	t.Run("push", func(t *testing.T) {
-		var td typeDeque
-		td.push(a)
-		td.push(b)
-		td.shift()
-
-		ts := make([]Type, 12)
-		for i := range ts {
-			td.push(&ts[i])
-		}
-
-		if td.shift() != b {
-			t.Error("Didn't shift b first")
-		}
-		for i := range ts {
-			if td.shift() != &ts[i] {
-				t.Fatal("Shifted wrong Type at pos", i)
-			}
-		}
-	})
-
-	t.Run("all", func(t *testing.T) {
-		var td typeDeque
-		td.push(a)
-		td.push(b)
-
-		all := td.all()
-		if len(all) != 2 {
-			t.Fatal("Expected 2 elements, got", len(all))
-		}
-
-		if all[0] != a || all[1] != b {
-			t.Fatal("Elements don't match")
-		}
-	})
+	return n
 }
 
 type testFormattableType struct {
@@ -315,7 +345,7 @@ func newCyclicalType(n int) Type {
 		case 3:
 			prev = &Typedef{Type: prev}
 		case 4:
-			prev = &Array{Type: prev}
+			prev = &Array{Type: prev, Index: &Int{Size: 1}}
 		}
 	}
 	ptr.Target = prev
@@ -331,6 +361,7 @@ func TestUnderlyingType(t *testing.T) {
 		{"volatile", func(t Type) Type { return &Volatile{Type: t} }},
 		{"restrict", func(t Type) Type { return &Restrict{Type: t} }},
 		{"typedef", func(t Type) Type { return &Typedef{Type: t} }},
+		{"type tag", func(t Type) Type { return &typeTag{Type: t} }},
 	}
 
 	for _, test := range wrappers {
@@ -383,7 +414,7 @@ func TestInflateLegacyBitfield(t *testing.T) {
 		{"struct after int", []rawType{rawInt, afterInt}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			types, err := inflateRawTypes(test.raw, nil, emptyStrings)
+			types, err := inflateRawTypes(test.raw, emptyStrings, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -407,6 +438,38 @@ func TestInflateLegacyBitfield(t *testing.T) {
 			}
 
 			t.Fatal("No Struct returned from inflateRawTypes")
+		})
+	}
+}
+
+func BenchmarkWalk(b *testing.B) {
+	types := []Type{
+		&Void{},
+		&Int{},
+		&Pointer{},
+		&Array{},
+		&Struct{Members: make([]Member, 2)},
+		&Union{Members: make([]Member, 2)},
+		&Enum{},
+		&Fwd{},
+		&Typedef{},
+		&Volatile{},
+		&Const{},
+		&Restrict{},
+		&Func{},
+		&FuncProto{Params: make([]FuncParam, 2)},
+		&Var{},
+		&Datasec{Vars: make([]VarSecinfo, 2)},
+	}
+
+	for _, typ := range types {
+		b.Run(fmt.Sprint(typ), func(b *testing.B) {
+			b.ReportAllocs()
+
+			for i := 0; i < b.N; i++ {
+				var dq typeDeque
+				walkType(typ, dq.Push)
+			}
 		})
 	}
 }

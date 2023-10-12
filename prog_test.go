@@ -28,7 +28,7 @@ func TestProgramRun(t *testing.T) {
 	testutils.SkipOnOldKernel(t, "4.8", "XDP program")
 
 	pat := []byte{0xDE, 0xAD, 0xBE, 0xEF}
-	buf := make([]byte, 14)
+	buf := internal.EmptyBPFContext
 
 	// r1  : ctx_start
 	// r1+4: ctx_end
@@ -110,10 +110,10 @@ func TestProgramRunWithOptions(t *testing.T) {
 	}
 	defer prog.Close()
 
-	buf := make([]byte, 14)
+	buf := internal.EmptyBPFContext
 	xdp := sys.XdpMd{
 		Data:    0,
-		DataEnd: 14,
+		DataEnd: uint32(len(buf)),
 	}
 	xdpOut := sys.XdpMd{}
 	opts := RunOptions{
@@ -176,7 +176,7 @@ func TestProgramRunEmptyData(t *testing.T) {
 func TestProgramBenchmark(t *testing.T) {
 	prog := mustSocketFilter(t)
 
-	ret, duration, err := prog.Benchmark(make([]byte, 14), 1, nil)
+	ret, duration, err := prog.Benchmark(internal.EmptyBPFContext, 1, nil)
 	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
 		t.Fatal("Error from Benchmark:", err)
@@ -220,7 +220,7 @@ func TestProgramTestRunInterrupt(t *testing.T) {
 		// Block this thread in the BPF syscall, so that we can
 		// trigger EINTR by sending a signal.
 		opts := RunOptions{
-			Data:   make([]byte, 14),
+			Data:   internal.EmptyBPFContext,
 			Repeat: math.MaxInt32,
 			Reset: func() {
 				// We don't know how long finishing the
@@ -230,7 +230,7 @@ func TestProgramTestRunInterrupt(t *testing.T) {
 				runtime.Goexit()
 			},
 		}
-		_, _, err := prog.testRun(&opts)
+		_, _, err := prog.run(&opts)
 
 		errs <- err
 	}()
@@ -298,6 +298,16 @@ func TestProgramPin(t *testing.T) {
 		t.Error("Expected pinned program to have type SocketFilter, but got", prog.Type())
 	}
 
+	if haveObjName() == nil {
+		if prog.name != "test" {
+			t.Errorf("Expected program to have object name 'test', got '%s'", prog.name)
+		}
+	} else {
+		if prog.name != "program" {
+			t.Errorf("Expected program to have file name 'program', got '%s'", prog.name)
+		}
+	}
+
 	if !prog.IsPinned() {
 		t.Error("Expected IsPinned to be true")
 	}
@@ -361,13 +371,14 @@ func TestProgramVerifierOutputOnError(t *testing.T) {
 		t.Fatal("Expected program to be invalid")
 	}
 
-	var ve *VerifierError
-	if !errors.As(err, &ve) {
-		t.Fatal("Error does not contain a VerifierError")
+	ve, ok := err.(*VerifierError)
+	if !ok {
+		t.Fatal("NewProgram does return an unwrapped VerifierError")
 	}
 
 	if !strings.Contains(ve.Error(), "R0 !read_ok") {
-		t.Error("Unexpected verifier error contents:", ve)
+		t.Logf("%+v", ve)
+		t.Error("Missing verifier log in error summary")
 	}
 }
 
@@ -390,7 +401,7 @@ func TestProgramKernelVersion(t *testing.T) {
 
 func TestProgramVerifierOutput(t *testing.T) {
 	prog, err := NewProgramWithOptions(socketFilterSpec, ProgramOptions{
-		LogLevel: 2,
+		LogLevel: LogLevelInstruction,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -409,7 +420,7 @@ func TestProgramVerifierOutput(t *testing.T) {
 		},
 		License: "MIT",
 	}, ProgramOptions{
-		LogLevel: 2,
+		LogLevel: LogLevelInstruction,
 	})
 
 	if err == nil {
@@ -420,6 +431,96 @@ func TestProgramVerifierOutput(t *testing.T) {
 	if !errors.As(err, &ve) {
 		t.Error("Error is not a VerifierError")
 	}
+}
+
+// Test all scenarios where the VerifierError.Truncated flag is expected to be
+// true, marked with an x. LL means ProgramOption.LogLevel.
+//
+// |      | Valid | Invalid |
+// |------|-------|---------|
+// | LL=0 |       |    x    |
+// | LL>0 |   x   |    x    |
+func TestProgramVerifierLogTruncated(t *testing.T) {
+	// Make the buffer intentionally small to coerce ENOSPC.
+	// 128 bytes is the smallest the kernel will accept.
+	logSize := 128
+
+	check := func(t *testing.T, err error) {
+		if err == nil {
+			t.Fatal("Expected an error")
+		}
+		var ve *internal.VerifierError
+		if !errors.As(err, &ve) {
+			t.Fatal("Error is not a VerifierError")
+		}
+		if !ve.Truncated {
+			t.Errorf("VerifierError is not truncated: %+v", ve)
+		}
+	}
+
+	// Generate a base program of sufficient size whose verifier log does not fit
+	// a 128-byte buffer. This should always result in ENOSPC, setting the
+	// VerifierError.Truncated flag.
+	base := func() (out asm.Instructions) {
+		for i := 0; i < 32; i++ {
+			out = append(out, asm.Mov.Reg(asm.R0, asm.R1))
+		}
+		return
+	}()
+
+	invalid := func() (out asm.Instructions) {
+		out = base
+		// Touch R10 (read-only frame pointer) to reliably force a verifier error.
+		out = append(out, asm.Mov.Reg(asm.R10, asm.R0))
+		out = append(out, asm.Return())
+		return
+	}()
+
+	valid := func() (out asm.Instructions) {
+		out = base
+		out = append(out, asm.Return())
+		return
+	}()
+
+	// Start out with testing against the invalid program.
+	spec := &ProgramSpec{
+		Type:         SocketFilter,
+		License:      "MIT",
+		Instructions: invalid,
+	}
+
+	// Set an undersized log buffer without explicitly requesting a verifier log
+	// for an invalid program.
+	_, err := NewProgramWithOptions(spec, ProgramOptions{LogSize: logSize})
+	check(t, err)
+
+	// Explicitly request a verifier log for an invalid program.
+	_, err = NewProgramWithOptions(spec, ProgramOptions{
+		LogSize:  logSize,
+		LogLevel: LogLevelInstruction,
+	})
+	check(t, err)
+
+	// Run tests against a valid program from here on out.
+	spec.Instructions = valid
+
+	// Don't request a verifier log, only set LogSize. Expect the valid program to
+	// be created without errors.
+	prog, err := NewProgramWithOptions(spec, ProgramOptions{
+		LogSize: logSize,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog.Close()
+
+	// Explicitly request verifier log for a valid program. If a log is requested
+	// and the buffer is too small, ENOSPC occurs even for valid programs.
+	_, err = NewProgramWithOptions(spec, ProgramOptions{
+		LogSize:  logSize,
+		LogLevel: LogLevelInstruction,
+	})
+	check(t, err)
 }
 
 func TestProgramWithUnsatisfiedMap(t *testing.T) {
@@ -521,22 +622,25 @@ func TestProgramFromFD(t *testing.T) {
 
 	// If you're thinking about copying this, don't. Use
 	// Clone() instead.
-	prog2, err := NewProgramFromFD(prog.FD())
+	prog2, err := NewProgramFromFD(dupFD(t, prog.FD()))
 	testutils.SkipIfNotSupported(t, err)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer prog2.Close()
 
-	// Both programs refer to the same fd now. Closing either of them will
-	// release the fd to the OS, which then might re-use that fd for another
-	// test. Once we close the second map we might close the re-used fd
-	// inadvertently, leading to spurious test failures.
-	// To avoid this we have to "leak" one of the programs.
-	prog2.fd.Forget()
+	// Name and type are supposed to be copied from program info.
+	if haveObjName() == nil && prog2.name != "test" {
+		t.Errorf("Expected program to have name test, got '%s'", prog2.name)
+	}
+
+	if prog2.typ != SocketFilter {
+		t.Errorf("Expected program to have type SocketFilter, got '%s'", prog2.typ)
+	}
 }
 
 func TestHaveProgTestRun(t *testing.T) {
-	testutils.CheckFeatureTest(t, haveProgTestRun)
+	testutils.CheckFeatureTest(t, haveProgRun)
 }
 
 func TestProgramGetNextID(t *testing.T) {
@@ -597,7 +701,7 @@ func TestProgramRejectIncorrectByteOrder(t *testing.T) {
 	spec := socketFilterSpec.Copy()
 
 	spec.ByteOrder = binary.BigEndian
-	if internal.NativeEndian == binary.BigEndian {
+	if spec.ByteOrder == internal.NativeEndian {
 		spec.ByteOrder = binary.LittleEndian
 	}
 
@@ -644,48 +748,84 @@ func TestProgramSpecTag(t *testing.T) {
 	}
 }
 
-func TestProgramTypeLSM(t *testing.T) {
-	lsmTests := []struct {
-		attachFn    string
+func TestProgramAttachToKernel(t *testing.T) {
+	// See https://github.com/torvalds/linux/commit/290248a5b7d829871b3ea3c62578613a580a1744
+	testutils.SkipOnOldKernel(t, "5.5", "attach_btf_id")
+
+	haveTestmod := haveTestmod(t)
+
+	tests := []struct {
+		attachTo    string
+		programType ProgramType
+		attachType  AttachType
 		flags       uint32
-		expectedErr bool
 	}{
 		{
-			attachFn: "task_getpgid",
+			attachTo:    "task_getpgid",
+			programType: LSM,
+			attachType:  AttachLSMMac,
 		},
 		{
-			attachFn:    "task_setnice",
-			flags:       unix.BPF_F_SLEEPABLE,
-			expectedErr: true,
+			attachTo:    "inet_dgram_connect",
+			programType: Tracing,
+			attachType:  AttachTraceFEntry,
 		},
 		{
-			attachFn: "file_open",
-			flags:    unix.BPF_F_SLEEPABLE,
+			attachTo:    "inet_dgram_connect",
+			programType: Tracing,
+			attachType:  AttachTraceFExit,
+		},
+		{
+			attachTo:    "bpf_modify_return_test",
+			programType: Tracing,
+			attachType:  AttachModifyReturn,
+		},
+		{
+			attachTo:    "kfree_skb",
+			programType: Tracing,
+			attachType:  AttachTraceRawTp,
+		},
+		{
+			attachTo:    "bpf_testmod_test_read",
+			programType: Tracing,
+			attachType:  AttachTraceFEntry,
+		},
+		{
+			attachTo:    "bpf_testmod_test_read",
+			programType: Tracing,
+			attachType:  AttachTraceFExit,
+		},
+		{
+			attachTo:    "bpf_testmod_test_read",
+			programType: Tracing,
+			attachType:  AttachModifyReturn,
+		},
+		{
+			attachTo:    "bpf_testmod_test_read",
+			programType: Tracing,
+			attachType:  AttachTraceRawTp,
 		},
 	}
-	for _, tt := range lsmTests {
-		t.Run(tt.attachFn, func(t *testing.T) {
+	for _, test := range tests {
+		name := fmt.Sprintf("%s:%s", test.attachType, test.attachTo)
+		t.Run(name, func(t *testing.T) {
+			if strings.HasPrefix(test.attachTo, "bpf_testmod_") && !haveTestmod {
+				t.Skip("bpf_testmod not loaded")
+			}
+
 			prog, err := NewProgram(&ProgramSpec{
-				AttachTo:   tt.attachFn,
-				AttachType: AttachLSMMac,
+				AttachTo:   test.attachTo,
+				AttachType: test.attachType,
 				Instructions: asm.Instructions{
 					asm.LoadImm(asm.R0, 0, asm.DWord),
 					asm.Return(),
 				},
 				License: "GPL",
-				Type:    LSM,
-				Flags:   tt.flags,
+				Type:    test.programType,
+				Flags:   test.flags,
 			})
-			testutils.SkipIfNotSupported(t, err)
-
-			if tt.flags&unix.BPF_F_SLEEPABLE != 0 {
-				testutils.SkipOnOldKernel(t, "5.11", "BPF_F_SLEEPABLE for LSM progs")
-			}
-			if tt.expectedErr && err == nil {
-				t.Errorf("Test case '%s': expected error", tt.attachFn)
-			}
-			if !tt.expectedErr && err != nil {
-				t.Errorf("Test case '%s': expected success", tt.attachFn)
+			if err != nil {
+				t.Fatal("Can't load program:", err)
 			}
 			prog.Close()
 		})
@@ -826,8 +966,8 @@ func mustSocketFilter(tb testing.TB) *Program {
 	return prog
 }
 
-// Retrieve a verifier error when loading a program fails.
-func ExampleProgram_verifierError() {
+// Print the full verifier log when loading a program fails.
+func ExampleVerifierError_retrieveFullLog() {
 	_, err := NewProgram(&ProgramSpec{
 		Type: SocketFilter,
 		Instructions: asm.Instructions{
@@ -845,10 +985,44 @@ func ExampleProgram_verifierError() {
 	}
 }
 
+// VerifierLog understands a variety of formatting flags.
+func ExampleVerifierError() {
+	err := internal.ErrorWithLog(
+		"catastrophe",
+		syscall.ENOSPC,
+		[]byte("first\nsecond\nthird"),
+		false,
+	)
+
+	fmt.Printf("With %%s: %s\n", err)
+	err.Truncated = true
+	fmt.Printf("With %%v and a truncated log: %v\n", err)
+	fmt.Printf("All log lines: %+v\n", err)
+	fmt.Printf("First line: %+1v\n", err)
+	fmt.Printf("Last two lines: %-2v\n", err)
+
+	// Output: With %s: catastrophe: no space left on device: third (2 line(s) omitted)
+	// With %v and a truncated log: catastrophe: no space left on device: second: third (truncated, 1 line(s) omitted)
+	// All log lines: catastrophe: no space left on device:
+	// 	first
+	// 	second
+	// 	third
+	// 	(truncated)
+	// First line: catastrophe: no space left on device:
+	// 	first
+	// 	(2 line(s) omitted)
+	// 	(truncated)
+	// Last two lines: catastrophe: no space left on device:
+	// 	(1 line(s) omitted)
+	// 	second
+	// 	third
+	// 	(truncated)
+}
+
 // Use NewProgramWithOptions if you'd like to get the verifier output
 // for a program, or if you want to change the buffer size used when
 // generating error messages.
-func ExampleProgram_retrieveVerifierOutput() {
+func ExampleProgram_retrieveVerifierLog() {
 	spec := &ProgramSpec{
 		Type: SocketFilter,
 		Instructions: asm.Instructions{
@@ -859,7 +1033,7 @@ func ExampleProgram_retrieveVerifierOutput() {
 	}
 
 	prog, err := NewProgramWithOptions(spec, ProgramOptions{
-		LogLevel: 2,
+		LogLevel: LogLevelInstruction,
 		LogSize:  1024,
 	})
 	if err != nil {
@@ -922,4 +1096,15 @@ func ExampleProgramSpec_Tag() {
 	} else {
 		fmt.Println("The programs are identical, tag is", tag)
 	}
+}
+
+func dupFD(tb testing.TB, fd int) int {
+	tb.Helper()
+
+	dup, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 1)
+	if err != nil {
+		tb.Fatal("Can't dup fd:", err)
+	}
+
+	return dup
 }

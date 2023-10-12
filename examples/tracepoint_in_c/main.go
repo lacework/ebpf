@@ -1,10 +1,7 @@
-//go:build linux
-// +build linux
-
 // This program demonstrates attaching an eBPF program to a kernel tracepoint.
 // The eBPF program will be attached to the page allocation tracepoint and
 // prints out the number of times it has been reached. The tracepoint fields
-// are printed into /sys/kernel/debug/tracing/trace_pipe.
+// are printed into /sys/kernel/tracing/trace_pipe.
 package main
 
 import (
@@ -15,8 +12,7 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-// $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf tracepoint.c -- -I../headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf tracepoint.c -- -I../headers
 
 const mapKey uint32 = 0
 
@@ -38,7 +34,7 @@ func main() {
 	// counter by 1. The read loop below polls this map value once per
 	// second.
 	// The first two arguments are taken from the following pathname:
-	// /sys/kernel/debug/tracing/events/kmem/mm_page_alloc
+	// /sys/kernel/tracing/events/kmem/mm_page_alloc
 	kp, err := link.Tracepoint("kmem", "mm_page_alloc", objs.MmPageAlloc, nil)
 	if err != nil {
 		log.Fatalf("opening tracepoint: %s", err)

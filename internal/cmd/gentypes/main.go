@@ -47,6 +47,13 @@ func run(args []string) error {
 	}
 
 	output, err := generateTypes(spec)
+	var fpe *failedPatchError
+	if errors.As(err, &fpe) {
+		fmt.Fprintf(os.Stderr, "  %v\n", fpe.Type)
+		for _, member := range fpe.Type.Members {
+			fmt.Fprintf(os.Stderr, "    %q %v\n", member.Name, member.Type)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -63,21 +70,21 @@ func run(args []string) error {
 func generateTypes(spec *btf.Spec) ([]byte, error) {
 	objName := &btf.Array{Nelems: 16, Type: &btf.Int{Encoding: btf.Char, Size: 1}}
 	linkID := &btf.Int{Size: 4}
+	btfID := &btf.Int{Size: 4}
+	typeID := &btf.Int{Size: 4}
 	pointer := &btf.Int{Size: 8}
-
-	// Pre-declare handwritten types sys.ObjName and sys.Pointer so that
-	// generated types can refer to them.
-	var (
-		_ sys.Pointer
-		_ sys.ObjName
-		_ sys.LinkID
-	)
+	logLevel := &btf.Int{Size: 4}
+	mapFlags := &btf.Int{Size: 4}
 
 	gf := &btf.GoFormatter{
 		Names: map[btf.Type]string{
-			objName: "ObjName",
-			linkID:  "LinkID",
-			pointer: "Pointer",
+			objName:  internal.GoTypeName(sys.ObjName{}),
+			linkID:   internal.GoTypeName(sys.LinkID(0)),
+			btfID:    internal.GoTypeName(sys.BTFID(0)),
+			typeID:   internal.GoTypeName(sys.TypeID(0)),
+			pointer:  internal.GoTypeName(sys.Pointer{}),
+			logLevel: internal.GoTypeName(sys.LogLevel(0)),
+			mapFlags: internal.GoTypeName(sys.MapFlags(0)),
 		},
 		Identifier: internal.Identifier,
 		EnumIdentifier: func(name, element string) string {
@@ -158,15 +165,26 @@ import (
 				replace(objName, "name"),
 				replace(pointer, "xlated_prog_insns"),
 				replace(pointer, "map_ids"),
+				replace(pointer, "line_info"),
+				replace(pointer, "func_info"),
+				replace(btfID, "btf_id", "attach_btf_obj_id"),
+				replace(typeID, "attach_btf_id"),
 			},
 		},
 		{
 			"MapInfo", "bpf_map_info",
-			[]patch{replace(objName, "name")},
+			[]patch{
+				replace(objName, "name"),
+				replace(mapFlags, "map_flags"),
+				replace(typeID, "btf_vmlinux_value_type_id", "btf_key_type_id", "btf_value_type_id"),
+			},
 		},
 		{
 			"BtfInfo", "bpf_btf_info",
-			[]patch{replace(pointer, "btf", "name")},
+			[]patch{
+				replace(pointer, "btf", "name"),
+				replace(btfID, "id"),
+			},
 		},
 		{
 			"LinkInfo", "bpf_link_info",
@@ -220,6 +238,8 @@ import (
 			[]patch{
 				replace(objName, "map_name"),
 				replace(enumTypes["MapType"], "map_type"),
+				replace(mapFlags, "map_flags"),
+				replace(typeID, "btf_vmlinux_value_type_id", "btf_key_type_id", "btf_value_type_id"),
 			},
 		},
 		{
@@ -271,6 +291,7 @@ import (
 				replace(objName, "prog_name"),
 				replace(enumTypes["ProgType"], "prog_type"),
 				replace(enumTypes["AttachType"], "expected_attach_type"),
+				replace(logLevel, "log_level"),
 				replace(pointer,
 					"insns",
 					"license",
@@ -280,6 +301,8 @@ import (
 					"fd_array",
 					"core_relos",
 				),
+				replace(typeID, "attach_btf_id"),
+				choose(20, "attach_btf_obj_fd"),
 			},
 		},
 		{
@@ -320,6 +343,14 @@ import (
 				truncateAfter("next_id"),
 			},
 		},
+		{
+			"BtfGetNextId", retError, "obj_next_id", "BPF_BTF_GET_NEXT_ID",
+			[]patch{
+				choose(0, "start_id"), rename("start_id", "id"),
+				replace(btfID, "id", "next_id"),
+				truncateAfter("next_id"),
+			},
+		},
 		// These piggy back on the obj_next_id decl, but only support the
 		// first field...
 		{
@@ -348,7 +379,11 @@ import (
 		},
 		{
 			"LinkCreate", retFd, "link_create", "BPF_LINK_CREATE",
-			[]patch{replace(enumTypes["AttachType"], "attach_type")},
+			[]patch{
+				replace(enumTypes["AttachType"], "attach_type"),
+				choose(4, "target_btf_id"),
+				replace(typeID, "target_btf_id"),
+			},
 		},
 		{
 			"LinkCreateIter", retFd, "link_create", "BPF_LINK_CREATE",
@@ -368,6 +403,30 @@ import (
 			},
 		},
 		{
+			"LinkCreateKprobeMulti", retFd, "link_create", "BPF_LINK_CREATE",
+			[]patch{
+				chooseNth(4, 3),
+				replace(enumTypes["AttachType"], "attach_type"),
+				modify(func(m *btf.Member) error {
+					return rename("flags", "kprobe_multi_flags")(m.Type.(*btf.Struct))
+				}, "kprobe_multi"),
+				flattenAnon,
+				replace(pointer, "cookies"),
+				replace(pointer, "addrs"),
+				replace(pointer, "syms"),
+				rename("cnt", "count"),
+			},
+		},
+		{
+			"LinkCreateTracing", retFd, "link_create", "BPF_LINK_CREATE",
+			[]patch{
+				chooseNth(4, 4),
+				replace(enumTypes["AttachType"], "attach_type"),
+				flattenAnon,
+				replace(btfID, "target_btf_id"),
+			},
+		},
+		{
 			"LinkUpdate", retError, "link_update", "BPF_LINK_UPDATE",
 			nil,
 		},
@@ -378,6 +437,14 @@ import (
 		{
 			"IterCreate", retFd, "iter_create", "BPF_ITER_CREATE",
 			nil,
+		},
+		{
+			"ProgQuery", retError, "prog_query", "BPF_PROG_QUERY",
+			[]patch{
+				replace(enumTypes["AttachType"], "attach_type"),
+				replace(pointer, "prog_ids"),
+				rename("prog_cnt", "prog_count"),
+			},
 		},
 	}
 
@@ -446,7 +513,10 @@ import (
 		{"IterLinkInfo", "iter", []patch{replace(pointer, "target_name"), truncateAfter("target_name_len")}},
 		{"NetNsLinkInfo", "netns", []patch{replace(enumTypes["AttachType"], "attach_type")}},
 		{"RawTracepointLinkInfo", "raw_tracepoint", []patch{replace(pointer, "tp_name")}},
-		{"TracingLinkInfo", "tracing", []patch{replace(enumTypes["AttachType"], "attach_type")}},
+		{"TracingLinkInfo", "tracing", []patch{
+			replace(enumTypes["AttachType"], "attach_type"),
+			replace(typeID, "target_btf_id")},
+		},
 		{"XDPLinkInfo", "xdp", nil},
 	}
 
@@ -487,12 +557,26 @@ import (
 	return w.Bytes(), nil
 }
 
+type failedPatchError struct {
+	Type   *btf.Struct
+	number int
+	err    error
+}
+
+func (fpe *failedPatchError) Unwrap() error {
+	return fpe.err
+}
+
+func (fpe *failedPatchError) Error() string {
+	return fmt.Sprintf("patch %d: %v", fpe.number, fpe.err)
+}
+
 func outputPatchedStruct(gf *btf.GoFormatter, w *bytes.Buffer, id string, s *btf.Struct, patches []patch) error {
 	s = btf.Copy(s, nil).(*btf.Struct)
 
 	for i, p := range patches {
 		if err := p(s); err != nil {
-			return fmt.Errorf("patch %d: %w", i, err)
+			return &failedPatchError{s, i, err}
 		}
 	}
 

@@ -1,6 +1,3 @@
-//go:build go1.18
-// +build go1.18
-
 package btf
 
 import (
@@ -29,7 +26,7 @@ func FuzzSpec(f *testing.F) {
 			t.Skip("data is too short")
 		}
 
-		spec, err := loadRawSpec(bytes.NewReader(data), internal.NativeEndian, nil, nil)
+		spec, err := loadRawSpec(bytes.NewReader(data), internal.NativeEndian, nil)
 		if err != nil {
 			if spec != nil {
 				t.Fatal("spec is not nil")
@@ -69,7 +66,10 @@ func FuzzExtInfo(f *testing.F) {
 			t.Skip("invalid string table")
 		}
 
-		info, err := loadExtInfos(bytes.NewReader(data), internal.NativeEndian, nil, table)
+		emptySpec := specFromTypes(t, nil)
+		emptySpec.strings = table
+
+		info, err := loadExtInfos(bytes.NewReader(data), internal.NativeEndian, emptySpec)
 		if err != nil {
 			if info != nil {
 				t.Fatal("info is not nil")

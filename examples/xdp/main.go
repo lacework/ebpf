@@ -1,6 +1,3 @@
-//go:build linux
-// +build linux
-
 // This program demonstrates attaching an eBPF program to a network interface
 // with XDP (eXpress Data Path). The program parses the IPv4 source address
 // from packets and writes the packet count by IP to an LRU hash map.
@@ -23,8 +20,7 @@ import (
 	"github.com/cilium/ebpf/link"
 )
 
-// $BPF_CLANG and $BPF_CFLAGS are set by the Makefile.
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf xdp.c -- -I../headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go bpf xdp.c -- -I../headers
 
 func main() {
 	if len(os.Args) < 2 {
@@ -73,7 +69,7 @@ func main() {
 
 func formatMapContents(m *ebpf.Map) (string, error) {
 	var (
-		sb strings.Builder
+		sb  strings.Builder
 		key []byte
 		val uint32
 	)

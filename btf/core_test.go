@@ -2,16 +2,53 @@ package btf
 
 import (
 	"errors"
-	"math/rand"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/cilium/ebpf/internal"
 	"github.com/cilium/ebpf/internal/testutils"
 	"github.com/google/go-cmp/cmp"
 
 	qt "github.com/frankban/quicktest"
 )
+
+func TestCheckTypeCompatibility(t *testing.T) {
+	tests := []struct {
+		a, b       Type
+		compatible bool
+	}{
+		{&FuncProto{Return: &Typedef{Type: &Int{}}}, &FuncProto{Return: &Int{}}, true},
+		{&FuncProto{Return: &Typedef{Type: &Int{}}}, &FuncProto{Return: &Void{}}, false},
+	}
+	for _, test := range tests {
+		err := CheckTypeCompatibility(test.a, test.b)
+		if test.compatible {
+			if err != nil {
+				t.Errorf("Expected types to be compatible: %s\na = %#v\nb = %#v", err, test.a, test.b)
+				continue
+			}
+		} else {
+			if !errors.Is(err, errIncompatibleTypes) {
+				t.Errorf("Expected types to be incompatible: %s\na = %#v\nb = %#v", err, test.a, test.b)
+				continue
+			}
+		}
+
+		err = CheckTypeCompatibility(test.b, test.a)
+		if test.compatible {
+			if err != nil {
+				t.Errorf("Expected reversed types to be compatible: %s\na = %#v\nb = %#v", err, test.a, test.b)
+			}
+		} else {
+			if !errors.Is(err, errIncompatibleTypes) {
+				t.Errorf("Expected reversed types to be incompatible: %s\na = %#v\nb = %#v", err, test.a, test.b)
+			}
+		}
+	}
+
+}
 
 func TestCOREAreTypesCompatible(t *testing.T) {
 	tests := []struct {
@@ -55,7 +92,7 @@ func TestCOREAreTypesCompatible(t *testing.T) {
 				continue
 			}
 		} else {
-			if !errors.Is(err, errImpossibleRelocation) {
+			if !errors.Is(err, errIncompatibleTypes) {
 				t.Errorf("Expected types to be incompatible: %s\na = %#v\nb = %#v", err, test.a, test.b)
 				continue
 			}
@@ -67,7 +104,7 @@ func TestCOREAreTypesCompatible(t *testing.T) {
 				t.Errorf("Expected reversed types to be compatible: %s\na = %#v\nb = %#v", err, test.a, test.b)
 			}
 		} else {
-			if !errors.Is(err, errImpossibleRelocation) {
+			if !errors.Is(err, errIncompatibleTypes) {
 				t.Errorf("Expected reversed types to be incompatible: %s\na = %#v\nb = %#v", err, test.a, test.b)
 			}
 		}
@@ -75,8 +112,8 @@ func TestCOREAreTypesCompatible(t *testing.T) {
 
 	for _, invalid := range []Type{&Var{}, &Datasec{}} {
 		err := coreAreTypesCompatible(invalid, invalid)
-		if errors.Is(err, errImpossibleRelocation) {
-			t.Errorf("Expected an error for %T, not errImpossibleRelocation", invalid)
+		if errors.Is(err, errIncompatibleTypes) {
+			t.Errorf("Expected an error for %T, not errIncompatibleTypes", invalid)
 		} else if err == nil {
 			t.Errorf("Expected an error for %T", invalid)
 		}
@@ -209,7 +246,7 @@ func TestCOREFindEnumValue(t *testing.T) {
 		name                    string
 		local, target           Type
 		acc                     coreAccessor
-		localValue, targetValue int32
+		localValue, targetValue uint64
 	}{
 		{"a to b", a, b, coreAccessor{0}, 23, 0},
 		{"b to a", b, a, coreAccessor{1}, 123, 42},
@@ -300,6 +337,13 @@ func TestCOREFindField(t *testing.T) {
 			&Union{Members: []Member{{Name: "foo", Type: &Pointer{}}}},
 			&Union{Members: []Member{{Name: "foo", Type: &Int{}}}},
 			coreAccessor{0, 0},
+			errImpossibleRelocation,
+		},
+		{
+			"unsized type",
+			bStruct, &Func{},
+			// non-zero accessor to force calculating the offset.
+			coreAccessor{1},
 			errImpossibleRelocation,
 		},
 	}
@@ -542,11 +586,11 @@ func TestCORERelocation(t *testing.T) {
 			name := strings.TrimPrefix(section, "socket_filter/")
 			t.Run(name, func(t *testing.T) {
 				var relos []*CORERelocation
-				for _, reloInfo := range extInfos.relocationInfos[section] {
+				for _, reloInfo := range extInfos.relocationInfos[section].infos {
 					relos = append(relos, reloInfo.relo)
 				}
 
-				fixups, err := CORERelocate(spec, spec, relos)
+				fixups, err := CORERelocate(relos, spec, spec.byteOrder)
 				if want := errs[name]; want != nil {
 					if !errors.Is(err, want) {
 						t.Fatal("Expected", want, "got", err)
@@ -605,10 +649,11 @@ func TestCORECopyWithoutQualifiers(t *testing.T) {
 	}
 
 	t.Run("long chain", func(t *testing.T) {
+		rng := testutils.Rand(t)
 		root := &Int{Name: "abc"}
 		v := Type(root)
 		for i := 0; i < maxTypeDepth; i++ {
-			q := qualifiers[rand.Intn(len(qualifiers))]
+			q := qualifiers[rng.Intn(len(qualifiers))]
 			v = q.fn(v)
 			t.Log(q.name)
 		}
@@ -616,4 +661,87 @@ func TestCORECopyWithoutQualifiers(t *testing.T) {
 		got := Copy(v, UnderlyingType)
 		qt.Assert(t, got, qt.DeepEquals, root)
 	})
+}
+
+func TestCOREReloFieldSigned(t *testing.T) {
+	for _, typ := range []Type{&Int{}, &Enum{}} {
+		t.Run(fmt.Sprintf("%T with invalid target", typ), func(t *testing.T) {
+			relo := &CORERelocation{
+				typ, coreAccessor{0}, reloFieldSigned, 0,
+			}
+			fixup, err := coreCalculateFixup(relo, &Void{}, 0, internal.NativeEndian)
+			qt.Assert(t, fixup.poison, qt.IsTrue)
+			qt.Assert(t, err, qt.IsNil)
+		})
+	}
+
+	t.Run("type without signedness", func(t *testing.T) {
+		relo := &CORERelocation{
+			&Array{}, coreAccessor{0}, reloFieldSigned, 0,
+		}
+		_, err := coreCalculateFixup(relo, &Array{}, 0, internal.NativeEndian)
+		qt.Assert(t, err, qt.ErrorIs, errNoSignedness)
+	})
+}
+
+func TestCOREReloFieldShiftU64(t *testing.T) {
+	typ := &Struct{
+		Members: []Member{
+			{Name: "A", Type: &Fwd{}},
+		},
+	}
+
+	for _, relo := range []*CORERelocation{
+		{typ, coreAccessor{0, 0}, reloFieldRShiftU64, 1},
+		{typ, coreAccessor{0, 0}, reloFieldLShiftU64, 1},
+	} {
+		t.Run(relo.kind.String(), func(t *testing.T) {
+			_, err := coreCalculateFixup(relo, typ, 1, internal.NativeEndian)
+			qt.Assert(t, err, qt.ErrorIs, errUnsizedType)
+		})
+	}
+}
+
+func BenchmarkCORESkBuff(b *testing.B) {
+	spec := vmlinuxTestdataSpec(b)
+
+	var skb *Struct
+	err := spec.TypeByName("sk_buff", &skb)
+	qt.Assert(b, err, qt.IsNil)
+
+	skbID, err := spec.TypeID(skb)
+	qt.Assert(b, err, qt.IsNil)
+
+	var pktHashTypes *Enum
+	err = spec.TypeByName("pkt_hash_types", &pktHashTypes)
+	qt.Assert(b, err, qt.IsNil)
+
+	pktHashTypesID, err := spec.TypeID(pktHashTypes)
+	qt.Assert(b, err, qt.IsNil)
+
+	for _, relo := range []*CORERelocation{
+		{skb, coreAccessor{0, 0}, reloFieldByteOffset, skbID},
+		{skb, coreAccessor{0, 0}, reloFieldByteSize, skbID},
+		{skb, coreAccessor{0, 0}, reloFieldExists, skbID},
+		{skb, coreAccessor{0, 0}, reloFieldSigned, skbID},
+		{skb, coreAccessor{0, 0}, reloFieldLShiftU64, skbID},
+		{skb, coreAccessor{0, 0}, reloFieldRShiftU64, skbID},
+		{skb, coreAccessor{0}, reloTypeIDLocal, skbID},
+		{skb, coreAccessor{0}, reloTypeIDTarget, skbID},
+		{skb, coreAccessor{0}, reloTypeExists, skbID},
+		{skb, coreAccessor{0}, reloTypeSize, skbID},
+		{pktHashTypes, coreAccessor{0}, reloEnumvalExists, pktHashTypesID},
+		{pktHashTypes, coreAccessor{0}, reloEnumvalValue, pktHashTypesID},
+	} {
+		b.Run(relo.kind.String(), func(b *testing.B) {
+			b.ReportAllocs()
+
+			for i := 0; i < b.N; i++ {
+				_, err = CORERelocate([]*CORERelocation{relo}, spec, spec.byteOrder)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }

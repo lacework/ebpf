@@ -5,14 +5,14 @@ import (
 	"strings"
 )
 
-//go:generate stringer -output opcode_string.go -type=Class
+//go:generate go run golang.org/x/tools/cmd/stringer@latest -output opcode_string.go -type=Class
 
 // Class of operations
 //
-//    msb      lsb
-//    +---+--+---+
-//    |  ??  |CLS|
-//    +---+--+---+
+//	msb      lsb
+//	+---+--+---+
+//	|  ??  |CLS|
+//	+---+--+---+
 type Class uint8
 
 const classMask OpCode = 0x07
@@ -70,10 +70,10 @@ func (cls Class) isJumpOrALU() bool {
 //
 // Its encoding is defined by a Class value:
 //
-//    msb      lsb
-//    +----+-+---+
-//    | ???? |CLS|
-//    +----+-+---+
+//	msb      lsb
+//	+----+-+---+
+//	| ???? |CLS|
+//	+----+-+---+
 type OpCode uint8
 
 // InvalidOpCode is returned by setters on OpCode

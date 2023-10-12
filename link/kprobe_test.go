@@ -2,7 +2,6 @@ package link
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"testing"
 
@@ -11,6 +10,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/internal/testutils"
+	"github.com/cilium/ebpf/internal/tracefs"
 	"github.com/cilium/ebpf/internal/unix"
 )
 
@@ -20,9 +20,8 @@ var ksym = "vprintk"
 // Collection of various symbols present in all tested kernels.
 // Compiler optimizations result in different names for these symbols.
 var symTests = []string{
-	"async_resume.cold",         // marked with 'cold' gcc attribute, unlikely to be executed
 	"echo_char.isra.0",          // function optimized by -fipa-sra
-	"get_buffer.constprop.0",    // optimized function with constant operands
+	"proc_get_long.constprop.0", // optimized function with constant operands
 	"unregister_kprobes.part.0", // function body that was split and partially inlined
 }
 
@@ -54,6 +53,44 @@ func TestKprobe(t *testing.T) {
 	testLink(t, k, prog)
 }
 
+func TestKprobeOffset(t *testing.T) {
+	prog := mustLoadProgram(t, ebpf.Kprobe, 0, "")
+
+	// The layout of a function is compiler and arch dependent, so we try to
+	// find a valid attach target in the first few bytes of the function.
+	for i := uint64(1); i < 16; i++ {
+		k, err := Kprobe("inet6_release", prog, &KprobeOptions{Offset: i})
+		if err != nil {
+			continue
+		}
+		k.Close()
+		return
+	}
+
+	t.Fatal("Can't attach with non-zero offset")
+}
+
+func TestKretprobeMaxActive(t *testing.T) {
+	prog := mustLoadProgram(t, ebpf.Kprobe, 0, "")
+	defer prog.Close()
+
+	_, err := Kprobe("do_sys_open", prog, &KprobeOptions{RetprobeMaxActive: 4096})
+	if !errors.Is(err, tracefs.ErrInvalidMaxActive) {
+		t.Fatal("Expected ErrInvalidMaxActive, got", err)
+	}
+
+	k, err := Kretprobe("__put_task_struct", prog, &KprobeOptions{RetprobeMaxActive: 4096})
+	if testutils.IsKernelLessThan(t, "4.12") && errors.Is(err, ErrNotSupported) {
+		t.Skip("Kernel doesn't support maxactive")
+	}
+	if err != nil {
+		t.Fatal("Kretprobe with maxactive returned an error:", err)
+	}
+	if err := k.Close(); err != nil {
+		t.Fatal("Closing kretprobe:", err)
+	}
+}
+
 func TestKretprobe(t *testing.T) {
 	prog := mustLoadProgram(t, ebpf.Kprobe, 0, "")
 
@@ -70,7 +107,9 @@ func TestKretprobe(t *testing.T) {
 	c := qt.New(t)
 
 	k, err := Kretprobe("bogus", prog, nil)
-	c.Assert(err, qt.ErrorIs, os.ErrNotExist, qt.Commentf("got error: %s", err))
+	if !(errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.EINVAL)) {
+		t.Fatal(err)
+	}
 	if k != nil {
 		k.Close()
 	}
@@ -108,27 +147,23 @@ func TestKprobeCreatePMU(t *testing.T) {
 	c := qt.New(t)
 
 	// kprobe happy path. printk is always present.
-	pk, err := pmuKprobe(probeArgs{symbol: ksym})
+	pk, err := pmuProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: ksym})
 	c.Assert(err, qt.IsNil)
 	defer pk.Close()
 
-	c.Assert(pk.typ, qt.Equals, kprobeEvent)
-
 	// kretprobe happy path.
-	pr, err := pmuKprobe(probeArgs{symbol: ksym, ret: true})
+	pr, err := pmuProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: ksym, Ret: true})
 	c.Assert(err, qt.IsNil)
 	defer pr.Close()
 
-	c.Assert(pr.typ, qt.Equals, kretprobeEvent)
-
 	// Expect os.ErrNotExist when specifying a non-existent kernel symbol
 	// on kernels 4.17 and up.
-	_, err = pmuKprobe(probeArgs{symbol: "bogus"})
+	_, err = pmuProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: "bogus"})
 	c.Assert(errors.Is(err, os.ErrNotExist), qt.IsTrue, qt.Commentf("got error: %s", err))
 
 	// A kernel bug was fixed in 97c753e62e6c where EINVAL was returned instead
 	// of ENOENT, but only for kretprobes.
-	_, err = pmuKprobe(probeArgs{symbol: "bogus", ret: true})
+	_, err = pmuProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: "bogus", Ret: true})
 	c.Assert(errors.Is(err, os.ErrNotExist), qt.IsTrue, qt.Commentf("got error: %s", err))
 }
 
@@ -136,7 +171,7 @@ func TestKprobeCreatePMU(t *testing.T) {
 func TestKprobePMUUnavailable(t *testing.T) {
 	c := qt.New(t)
 
-	pk, err := pmuKprobe(probeArgs{symbol: ksym})
+	pk, err := pmuProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: ksym})
 	if err == nil {
 		pk.Close()
 		t.Skipf("Kernel supports perf_kprobe PMU, not asserting error.")
@@ -148,7 +183,7 @@ func TestKprobePMUUnavailable(t *testing.T) {
 
 func BenchmarkKprobeCreatePMU(b *testing.B) {
 	for n := 0; n < b.N; n++ {
-		pr, err := pmuKprobe(probeArgs{symbol: ksym})
+		pr, err := pmuProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: ksym})
 		if err != nil {
 			b.Error("error creating perf_kprobe PMU:", err)
 		}
@@ -164,49 +199,59 @@ func TestKprobeTraceFS(t *testing.T) {
 	c := qt.New(t)
 
 	// Open and close tracefs k(ret)probes, checking all errors.
-	kp, err := tracefsKprobe(probeArgs{symbol: ksym})
+	kp, err := tracefsProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: ksym})
 	c.Assert(err, qt.IsNil)
 	c.Assert(kp.Close(), qt.IsNil)
-	c.Assert(kp.typ, qt.Equals, kprobeEvent)
 
-	kp, err = tracefsKprobe(probeArgs{symbol: ksym, ret: true})
+	kp, err = tracefsProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: ksym, Ret: true})
 	c.Assert(err, qt.IsNil)
 	c.Assert(kp.Close(), qt.IsNil)
-	c.Assert(kp.typ, qt.Equals, kretprobeEvent)
 
 	// Create two identical trace events, ensure their IDs differ.
-	k1, err := tracefsKprobe(probeArgs{symbol: ksym})
+	k1, err := tracefsProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: ksym})
 	c.Assert(err, qt.IsNil)
 	defer k1.Close()
-	c.Assert(k1.tracefsID, qt.Not(qt.Equals), 0)
+	c.Assert(k1.tracefsEvent, qt.IsNotNil)
 
-	k2, err := tracefsKprobe(probeArgs{symbol: ksym})
+	k2, err := tracefsProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: ksym})
 	c.Assert(err, qt.IsNil)
 	defer k2.Close()
-	c.Assert(k2.tracefsID, qt.Not(qt.Equals), 0)
+	c.Assert(k2.tracefsEvent, qt.IsNotNil)
 
 	// Compare the kprobes' tracefs IDs.
-	c.Assert(k1.tracefsID, qt.Not(qt.CmpEquals()), k2.tracefsID)
+	c.Assert(k1.tracefsEvent.ID(), qt.Not(qt.Equals), k2.tracefsEvent.ID())
+
+	// Expect an error when supplying an invalid custom group name
+	_, err = tracefsProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: ksym, Group: "/"})
+	c.Assert(err, qt.Not(qt.IsNil))
+
+	cg := "customgroup"
+	k3, err := tracefsProbe(tracefs.ProbeArgs{Type: tracefs.Kprobe, Symbol: ksym, Group: cg})
+	c.Assert(err, qt.IsNil)
+	defer k3.Close()
+	c.Assert(k3.tracefsEvent.Group(), qt.Matches, `customgroup_[a-f0-9]{16}`)
 
 	// Prepare probe args.
-	args := probeArgs{group: "testgroup", symbol: "symbol"}
+	args := tracefs.ProbeArgs{Type: tracefs.Kprobe, Group: "testgroup", Symbol: "symbol"}
 
 	// Write a k(ret)probe event for a non-existing symbol.
-	err = createTraceFSProbeEvent(kprobeType, args)
+	_, err = tracefs.NewEvent(args)
 	c.Assert(errors.Is(err, os.ErrNotExist), qt.IsTrue, qt.Commentf("got error: %s", err))
 
 	// A kernel bug was fixed in 97c753e62e6c where EINVAL was returned instead
 	// of ENOENT, but only for kretprobes.
-	args.ret = true
-	err = createTraceFSProbeEvent(kprobeType, args)
-	c.Assert(errors.Is(err, os.ErrNotExist), qt.IsTrue, qt.Commentf("got error: %s", err))
+	args.Ret = true
+	_, err = tracefs.NewEvent(args)
+	if !(errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.EINVAL)) {
+		t.Fatal(err)
+	}
 }
 
 func BenchmarkKprobeCreateTraceFS(b *testing.B) {
 	for n := 0; n < b.N; n++ {
 		// Include <tracefs>/kprobe_events operations in the benchmark loop
 		// because we create one per perf event.
-		pr, err := tracefsKprobe(probeArgs{symbol: ksym})
+		pr, err := tracefsProbe(tracefs.ProbeArgs{Symbol: ksym})
 		if err != nil {
 			b.Error("error creating tracefs perf event:", err)
 		}
@@ -217,91 +262,8 @@ func BenchmarkKprobeCreateTraceFS(b *testing.B) {
 	}
 }
 
-// Test k(ret)probe creation writing directly to <tracefs>/kprobe_events.
-// Only runs on 5.0 and over. Earlier versions ignored writes of duplicate
-// events, while 5.0 started returning -EEXIST when a kprobe event already
-// exists.
-func TestKprobeCreateTraceFS(t *testing.T) {
-	testutils.SkipOnOldKernel(t, "5.0", "<tracefs>/kprobe_events doesn't reject duplicate events")
-
-	c := qt.New(t)
-
-	pg, _ := randomGroup("ebpftest")
-	rg, _ := randomGroup("ebpftest")
-
-	// Tee up cleanups in case any of the Asserts abort the function.
-	defer func() {
-		_ = closeTraceFSProbeEvent(kprobeType, pg, ksym)
-		_ = closeTraceFSProbeEvent(kprobeType, rg, ksym)
-	}()
-
-	// Prepare probe args.
-	args := probeArgs{group: pg, symbol: ksym}
-
-	// Create a kprobe.
-	err := createTraceFSProbeEvent(kprobeType, args)
-	c.Assert(err, qt.IsNil)
-
-	// Attempt to create an identical kprobe using tracefs,
-	// expect it to fail with os.ErrExist.
-	err = createTraceFSProbeEvent(kprobeType, args)
-	c.Assert(errors.Is(err, os.ErrExist), qt.IsTrue,
-		qt.Commentf("expected consecutive kprobe creation to contain os.ErrExist, got: %v", err))
-
-	// Expect a successful close of the kprobe.
-	c.Assert(closeTraceFSProbeEvent(kprobeType, pg, ksym), qt.IsNil)
-
-	args.group = rg
-	args.ret = true
-
-	// Same test for a kretprobe.
-	err = createTraceFSProbeEvent(kprobeType, args)
-	c.Assert(err, qt.IsNil)
-
-	err = createTraceFSProbeEvent(kprobeType, args)
-	c.Assert(os.IsExist(err), qt.IsFalse,
-		qt.Commentf("expected consecutive kretprobe creation to contain os.ErrExist, got: %v", err))
-
-	// Expect a successful close of the kretprobe.
-	c.Assert(closeTraceFSProbeEvent(kprobeType, rg, ksym), qt.IsNil)
-}
-
-func TestKprobeTraceFSGroup(t *testing.T) {
-	c := qt.New(t)
-
-	// Expect <prefix>_<16 random hex chars>.
-	g, err := randomGroup("ebpftest")
-	c.Assert(err, qt.IsNil)
-	c.Assert(g, qt.Matches, `ebpftest_[a-f0-9]{16}`)
-
-	// Expect error when the generator's output exceeds 63 characters.
-	p := make([]byte, 47) // 63 - 17 (length of the random suffix and underscore) + 1
-	for i := range p {
-		p[i] = byte('a')
-	}
-	_, err = randomGroup(string(p))
-	c.Assert(err, qt.Not(qt.IsNil))
-
-	// Reject non-alphanumeric characters.
-	_, err = randomGroup("/")
-	c.Assert(err, qt.Not(qt.IsNil))
-}
-
-func TestDetermineRetprobeBit(t *testing.T) {
-	testutils.SkipOnOldKernel(t, "4.17", "perf_kprobe PMU")
-	c := qt.New(t)
-
-	rpk, err := kretprobeBit()
-	c.Assert(err, qt.IsNil)
-	c.Assert(rpk, qt.Equals, uint64(0))
-
-	rpu, err := uretprobeBit()
-	c.Assert(err, qt.IsNil)
-	c.Assert(rpu, qt.Equals, uint64(0))
-}
-
 func TestKprobeProgramCall(t *testing.T) {
-	m, p := newUpdaterMapProg(t, ebpf.Kprobe)
+	m, p := newUpdaterMapProg(t, ebpf.Kprobe, 0)
 
 	// Open Kprobe on `sys_getpid` and attach it
 	// to the ebpf program created above.
@@ -333,7 +295,7 @@ func TestKprobeProgramCall(t *testing.T) {
 	assertMapValue(t, m, 0, 0)
 }
 
-func newUpdaterMapProg(t *testing.T, typ ebpf.ProgramType) (*ebpf.Map, *ebpf.Program) {
+func newUpdaterMapProg(t *testing.T, typ ebpf.ProgramType, attach ebpf.AttachType) (*ebpf.Map, *ebpf.Program) {
 	// Create ebpf map. Will contain only one key with initial value 0.
 	m, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Array,
@@ -371,7 +333,8 @@ func newUpdaterMapProg(t *testing.T, typ ebpf.ProgramType) (*ebpf.Map, *ebpf.Pro
 			asm.Mov.Imm(asm.R0, 0),
 			asm.Return(),
 		},
-		License: "Dual MIT/GPL",
+		AttachType: attach,
+		License:    "Dual MIT/GPL",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -405,25 +368,4 @@ func TestKprobeCookie(t *testing.T) {
 		t.Fatal(err)
 	}
 	k.Close()
-}
-
-func TestKprobeToken(t *testing.T) {
-	tests := []struct {
-		args     probeArgs
-		expected string
-	}{
-		{probeArgs{symbol: "symbol"}, "symbol"},
-		{probeArgs{symbol: "symbol", offset: 1}, "symbol+0x1"},
-		{probeArgs{symbol: "symbol", offset: 65535}, "symbol+0xffff"},
-		{probeArgs{symbol: "symbol", offset: 65536}, "symbol+0x10000"},
-	}
-
-	for i, tt := range tests {
-		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			po := kprobeToken(tt.args)
-			if tt.expected != po {
-				t.Errorf("Expected symbol+offset to be '%s', got '%s'", tt.expected, po)
-			}
-		})
-	}
 }

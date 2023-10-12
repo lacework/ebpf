@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"go/format"
+	"math"
 	"strings"
 	"testing"
 )
@@ -15,17 +16,34 @@ func TestGoTypeDeclaration(t *testing.T) {
 	}{
 		{&Int{Size: 1}, "type t uint8"},
 		{&Int{Size: 1, Encoding: Bool}, "type t bool"},
-		{&Int{Size: 2, Encoding: Bool}, "type t uint16"},
 		{&Int{Size: 1, Encoding: Char}, "type t uint8"},
-		{&Int{Size: 1, Encoding: Char | Signed}, "type t int8"},
-		{&Int{Size: 2, Encoding: Char}, "type t uint16"},
 		{&Int{Size: 2, Encoding: Signed}, "type t int16"},
 		{&Int{Size: 4, Encoding: Signed}, "type t int32"},
 		{&Int{Size: 8}, "type t uint64"},
 		{&Typedef{Name: "frob", Type: &Int{Size: 8}}, "type t uint64"},
-		{&Int{Size: 16}, "type t uint128"},
-		{&Enum{Values: []EnumValue{{"FOO", 32}}, Size: 4}, "type t int32; const ( tFOO t = 32; )"},
-		{&Enum{Values: []EnumValue{{"BAR", 1}}, Size: 1}, "type t int8; const ( tBAR t = 1; )"},
+		{&Int{Size: 16}, "type t [16]byte /* uint128 */"},
+		{&Enum{Values: []EnumValue{{"FOO", 32}}, Size: 4}, "type t uint32; const ( tFOO t = 32; )"},
+		{
+			&Enum{
+				Values: []EnumValue{
+					{"MINUS_ONE", math.MaxUint64},
+					{"MINUS_TWO", math.MaxUint64 - 1},
+				},
+				Size:   1,
+				Signed: true,
+			},
+			"type t int8; const ( tMINUS_ONE t = -1; tMINUS_TWO t = -2; )",
+		},
+		{
+			&Struct{
+				Name: "enum literals",
+				Size: 2,
+				Members: []Member{
+					{Name: "enum", Type: &Enum{Values: []EnumValue{{"BAR", 1}}, Size: 2}, Offset: 0},
+				},
+			},
+			"type t struct { enum uint16; }",
+		},
 		{&Array{Nelems: 2, Type: &Int{Size: 1}}, "type t [2]uint8"},
 		{
 			&Union{
@@ -155,12 +173,12 @@ func TestGoTypeDeclarationNamed(t *testing.T) {
 		named  []Type
 		output string
 	}{
-		{e1, []Type{e1}, "type t int32"},
+		{e1, []Type{e1}, "type t uint32"},
 		{s1, []Type{e1, s1}, "type t struct { frob E1; }"},
 		{s2, []Type{e1}, "type t struct { frood struct { frob E1; }; }"},
 		{s2, []Type{e1, s1}, "type t struct { frood S1; }"},
-		{td, nil, "type t int32"},
-		{td, []Type{td}, "type t int32"},
+		{td, nil, "type t uint32"},
+		{td, []Type{td}, "type t uint32"},
 		{arr, []Type{td}, "type t [1]TD"},
 	}
 
@@ -209,6 +227,32 @@ func TestGoTypeDeclarationCycle(t *testing.T) {
 	_, err := gf.TypeDeclaration("t", s)
 	if !errors.Is(err, errNestedTooDeep) {
 		t.Fatal("Expected errNestedTooDeep, got", err)
+	}
+}
+
+func TestRejectBogusTypes(t *testing.T) {
+	tests := []struct {
+		typ Type
+	}{
+		{&Struct{
+			Size: 1,
+			Members: []Member{
+				{Name: "foo", Type: &Int{Size: 2}, Offset: 0},
+			},
+		}},
+		{&Int{Size: 2, Encoding: Bool}},
+		{&Int{Size: 1, Encoding: Char | Signed}},
+		{&Int{Size: 2, Encoding: Char}},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprint(test.typ), func(t *testing.T) {
+			var gf GoFormatter
+
+			_, err := gf.TypeDeclaration("t", test.typ)
+			if err == nil {
+				t.Fatal("TypeDeclaration does not reject bogus type")
+			}
+		})
 	}
 }
 

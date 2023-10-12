@@ -2,37 +2,46 @@ package btf
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"unsafe"
+
+	"github.com/cilium/ebpf/internal"
 )
 
-//go:generate stringer -linecomment -output=btf_types_string.go -type=FuncLinkage,VarLinkage
+//go:generate go run golang.org/x/tools/cmd/stringer@latest -linecomment -output=btf_types_string.go -type=FuncLinkage,VarLinkage,btfKind
 
 // btfKind describes a Type.
 type btfKind uint8
 
 // Equivalents of the BTF_KIND_* constants.
 const (
-	kindUnknown btfKind = iota
-	kindInt
-	kindPointer
-	kindArray
-	kindStruct
-	kindUnion
-	kindEnum
-	kindForward
-	kindTypedef
-	kindVolatile
-	kindConst
-	kindRestrict
+	kindUnknown  btfKind = iota // Unknown
+	kindInt                     // Int
+	kindPointer                 // Pointer
+	kindArray                   // Array
+	kindStruct                  // Struct
+	kindUnion                   // Union
+	kindEnum                    // Enum
+	kindForward                 // Forward
+	kindTypedef                 // Typedef
+	kindVolatile                // Volatile
+	kindConst                   // Const
+	kindRestrict                // Restrict
 	// Added ~4.20
-	kindFunc
-	kindFuncProto
+	kindFunc      // Func
+	kindFuncProto // FuncProto
 	// Added ~5.1
-	kindVar
-	kindDatasec
+	kindVar     // Var
+	kindDatasec // Datasec
 	// Added ~5.13
-	kindFloat
+	kindFloat // Float
+	// Added 5.16
+	kindDeclTag // DeclTag
+	kindTypeTag // TypeTag
+	// Added 6.0
+	kindEnum64 // Enum64
 )
 
 // FuncLinkage describes BTF function linkage metadata.
@@ -63,6 +72,65 @@ const (
 	btfTypeKindFlagMask  = 1
 )
 
+var btfHeaderLen = binary.Size(&btfHeader{})
+
+type btfHeader struct {
+	Magic   uint16
+	Version uint8
+	Flags   uint8
+	HdrLen  uint32
+
+	TypeOff   uint32
+	TypeLen   uint32
+	StringOff uint32
+	StringLen uint32
+}
+
+// typeStart returns the offset from the beginning of the .BTF section
+// to the start of its type entries.
+func (h *btfHeader) typeStart() int64 {
+	return int64(h.HdrLen + h.TypeOff)
+}
+
+// stringStart returns the offset from the beginning of the .BTF section
+// to the start of its string table.
+func (h *btfHeader) stringStart() int64 {
+	return int64(h.HdrLen + h.StringOff)
+}
+
+// parseBTFHeader parses the header of the .BTF section.
+func parseBTFHeader(r io.Reader, bo binary.ByteOrder) (*btfHeader, error) {
+	var header btfHeader
+	if err := binary.Read(r, bo, &header); err != nil {
+		return nil, fmt.Errorf("can't read header: %v", err)
+	}
+
+	if header.Magic != btfMagic {
+		return nil, fmt.Errorf("incorrect magic value %v", header.Magic)
+	}
+
+	if header.Version != 1 {
+		return nil, fmt.Errorf("unexpected version %v", header.Version)
+	}
+
+	if header.Flags != 0 {
+		return nil, fmt.Errorf("unsupported flags %v", header.Flags)
+	}
+
+	remainder := int64(header.HdrLen) - int64(binary.Size(&header))
+	if remainder < 0 {
+		return nil, errors.New("header length shorter than btfHeader size")
+	}
+
+	if _, err := io.CopyN(internal.DiscardZeroes{}, r, remainder); err != nil {
+		return nil, fmt.Errorf("header padding: %v", err)
+	}
+
+	return &header, nil
+}
+
+var btfTypeLen = binary.Size(btfType{})
+
 // btfType is equivalent to struct btf_type in Documentation/bpf/btf.rst.
 type btfType struct {
 	NameOff uint32
@@ -83,47 +151,6 @@ type btfType struct {
 	 * "type" is a type_id referring to another type.
 	 */
 	SizeType uint32
-}
-
-func (k btfKind) String() string {
-	switch k {
-	case kindUnknown:
-		return "Unknown"
-	case kindInt:
-		return "Integer"
-	case kindPointer:
-		return "Pointer"
-	case kindArray:
-		return "Array"
-	case kindStruct:
-		return "Struct"
-	case kindUnion:
-		return "Union"
-	case kindEnum:
-		return "Enumeration"
-	case kindForward:
-		return "Forward"
-	case kindTypedef:
-		return "Typedef"
-	case kindVolatile:
-		return "Volatile"
-	case kindConst:
-		return "Const"
-	case kindRestrict:
-		return "Restrict"
-	case kindFunc:
-		return "Function"
-	case kindFuncProto:
-		return "Function Proto"
-	case kindVar:
-		return "Variable"
-	case kindDatasec:
-		return "Section"
-	case kindFloat:
-		return "Float"
-	default:
-		return fmt.Sprintf("Unknown (%d)", k)
-	}
 }
 
 func mask(len uint32) uint32 {
@@ -164,8 +191,41 @@ func (bt *btfType) SetVlen(vlen int) {
 	bt.setInfo(uint32(vlen), btfTypeVlenMask, btfTypeVlenShift)
 }
 
-func (bt *btfType) KindFlag() bool {
+func (bt *btfType) kindFlagBool() bool {
 	return bt.info(btfTypeKindFlagMask, btfTypeKindFlagShift) == 1
+}
+
+func (bt *btfType) setKindFlagBool(set bool) {
+	var value uint32
+	if set {
+		value = 1
+	}
+	bt.setInfo(value, btfTypeKindFlagMask, btfTypeKindFlagShift)
+}
+
+// Bitfield returns true if the struct or union contain a bitfield.
+func (bt *btfType) Bitfield() bool {
+	return bt.kindFlagBool()
+}
+
+func (bt *btfType) SetBitfield(isBitfield bool) {
+	bt.setKindFlagBool(isBitfield)
+}
+
+func (bt *btfType) FwdKind() FwdKind {
+	return FwdKind(bt.info(btfTypeKindFlagMask, btfTypeKindFlagShift))
+}
+
+func (bt *btfType) SetFwdKind(kind FwdKind) {
+	bt.setInfo(uint32(kind), btfTypeKindFlagMask, btfTypeKindFlagShift)
+}
+
+func (bt *btfType) Signed() bool {
+	return bt.kindFlagBool()
+}
+
+func (bt *btfType) SetSigned(signed bool) {
+	bt.setKindFlagBool(signed)
 }
 
 func (bt *btfType) Linkage() FuncLinkage {
@@ -181,6 +241,10 @@ func (bt *btfType) Type() TypeID {
 	return TypeID(bt.SizeType)
 }
 
+func (bt *btfType) SetType(id TypeID) {
+	bt.SizeType = uint32(id)
+}
+
 func (bt *btfType) Size() uint32 {
 	// TODO: Panic here if wrong kind?
 	return bt.SizeType
@@ -190,13 +254,22 @@ func (bt *btfType) SetSize(size uint32) {
 	bt.SizeType = size
 }
 
+func (bt *btfType) Marshal(w io.Writer, bo binary.ByteOrder) error {
+	buf := make([]byte, unsafe.Sizeof(*bt))
+	bo.PutUint32(buf[0:], bt.NameOff)
+	bo.PutUint32(buf[4:], bt.Info)
+	bo.PutUint32(buf[8:], bt.SizeType)
+	_, err := w.Write(buf)
+	return err
+}
+
 type rawType struct {
 	btfType
 	data interface{}
 }
 
 func (rt *rawType) Marshal(w io.Writer, bo binary.ByteOrder) error {
-	if err := binary.Write(w, bo, &rt.btfType); err != nil {
+	if err := rt.btfType.Marshal(w, bo); err != nil {
 		return err
 	}
 
@@ -209,11 +282,11 @@ func (rt *rawType) Marshal(w io.Writer, bo binary.ByteOrder) error {
 
 // btfInt encodes additional data for integers.
 //
-//    ? ? ? ? e e e e o o o o o o o o ? ? ? ? ? ? ? ? b b b b b b b b
-//    ? = undefined
-//    e = encoding
-//    o = offset (bitfields?)
-//    b = bits (bitfields)
+//	? ? ? ? e e e e o o o o o o o o ? ? ? ? ? ? ? ? b b b b b b b b
+//	? = undefined
+//	e = encoding
+//	o = offset (bitfields?)
+//	b = bits (bitfields)
 type btfInt struct {
 	Raw uint32
 }
@@ -275,7 +348,13 @@ type btfVariable struct {
 
 type btfEnum struct {
 	NameOff uint32
-	Val     int32
+	Val     uint32
+}
+
+type btfEnum64 struct {
+	NameOff uint32
+	ValLo32 uint32
+	ValHi32 uint32
 }
 
 type btfParam struct {
@@ -283,12 +362,16 @@ type btfParam struct {
 	Type    TypeID
 }
 
+type btfDeclTag struct {
+	ComponentIdx uint32
+}
+
 func readTypes(r io.Reader, bo binary.ByteOrder, typeLen uint32) ([]rawType, error) {
 	var header btfType
 	// because of the interleaving between types and struct members it is difficult to
 	// precompute the numbers of raw types this will parse
 	// this "guess" is a good first estimation
-	sizeOfbtfType := uintptr(binary.Size(btfType{}))
+	sizeOfbtfType := uintptr(btfTypeLen)
 	tyMaxCount := uintptr(typeLen) / sizeOfbtfType / 2
 	types := make([]rawType, 0, tyMaxCount)
 
@@ -325,6 +408,11 @@ func readTypes(r io.Reader, bo binary.ByteOrder, typeLen uint32) ([]rawType, err
 		case kindDatasec:
 			data = make([]btfVarSecinfo, header.Vlen())
 		case kindFloat:
+		case kindDeclTag:
+			data = new(btfDeclTag)
+		case kindTypeTag:
+		case kindEnum64:
+			data = make([]btfEnum64, header.Vlen())
 		default:
 			return nil, fmt.Errorf("type id %v: unknown kind: %v", id, header.Kind())
 		}

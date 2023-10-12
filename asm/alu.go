@@ -1,13 +1,13 @@
 package asm
 
-//go:generate stringer -output alu_string.go -type=Source,Endianness,ALUOp
+//go:generate go run golang.org/x/tools/cmd/stringer@latest -output alu_string.go -type=Source,Endianness,ALUOp
 
 // Source of ALU / ALU64 / Branch operations
 //
-//    msb      lsb
-//    +----+-+---+
-//    |op  |S|cls|
-//    +----+-+---+
+//	msb      lsb
+//	+----+-+---+
+//	|op  |S|cls|
+//	+----+-+---+
 type Source uint8
 
 const sourceMask OpCode = 0x08
@@ -39,10 +39,10 @@ const (
 
 // ALUOp are ALU / ALU64 operations
 //
-//    msb      lsb
-//    +----+-+---+
-//    |OP  |s|cls|
-//    +----+-+---+
+//	msb      lsb
+//	+----+-+---+
+//	|OP  |s|cls|
+//	+----+-+---+
 type ALUOp uint8
 
 const aluMask OpCode = 0xf0
@@ -75,7 +75,7 @@ const (
 	Xor ALUOp = 0xa0
 	// Mov - move value from one place to another
 	Mov ALUOp = 0xb0
-	// ArSh - arithmatic shift
+	// ArSh - arithmetic shift
 	ArSh ALUOp = 0xc0
 	// Swap - endian conversions
 	Swap ALUOp = 0xd0

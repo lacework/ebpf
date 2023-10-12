@@ -19,14 +19,11 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+
+	qt "github.com/frankban/quicktest"
 )
 
 func TestLoadCollectionSpec(t *testing.T) {
-	cpus, err := internal.PossibleCPUs()
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	coll := &CollectionSpec{
 		Maps: map[string]*MapSpec{
 			"hash_map": {
@@ -53,10 +50,8 @@ func TestLoadCollectionSpec(t *testing.T) {
 			"perf_event_array": {
 				Name:       "perf_event_array",
 				Type:       PerfEventArray,
-				MaxEntries: uint32(cpus),
+				MaxEntries: 4096,
 			},
-			// Maps prefixed by btf_ are ignored when testing ELFs
-			// that don't have BTF info embedded. (clang<9)
 			"btf_pin": {
 				Name:       "btf_pin",
 				Type:       Hash,
@@ -92,6 +87,13 @@ func TestLoadCollectionSpec(t *testing.T) {
 					ValueSize:  4,
 					MaxEntries: 1,
 				},
+			},
+			"btf_typedef_map": {
+				Name:       "btf_typedef_map",
+				Type:       Array,
+				KeySize:    4,
+				ValueSize:  8,
+				MaxEntries: 1,
 			},
 		},
 		Programs: map[string]*ProgramSpec{
@@ -140,7 +142,7 @@ func TestLoadCollectionSpec(t *testing.T) {
 		},
 	}
 
-	defaultOpts := cmp.Options{
+	cmpOpts := cmp.Options{
 		// Dummy Comparer that works with empty readers to support test cases.
 		cmp.Comparer(func(a, b bytes.Reader) bool {
 			if a.Len() == 0 && b.Len() == 0 {
@@ -161,39 +163,28 @@ func TestLoadCollectionSpec(t *testing.T) {
 		}),
 	}
 
-	ignoreBTFOpts := append(defaultOpts,
-		cmpopts.IgnoreMapEntries(func(key string, _ *MapSpec) bool {
-			return strings.HasPrefix(key, "btf_")
-		}),
-	)
-
 	testutils.Files(t, testutils.Glob(t, "testdata/loader-*.elf"), func(t *testing.T, file string) {
 		have, err := LoadCollectionSpec(file)
 		if err != nil {
 			t.Fatal("Can't parse ELF:", err)
 		}
 
-		opts := defaultOpts
-		if have.Types != nil {
-			err := have.RewriteConstants(map[string]interface{}{
-				"arg":  uint32(1),
-				"arg2": uint32(2),
-			})
-			if err != nil {
-				t.Fatal("Can't rewrite constant:", err)
-			}
-
-			err = have.RewriteConstants(map[string]interface{}{
-				"totallyBogus": uint32(1),
-			})
-			if err == nil {
-				t.Error("Rewriting a bogus constant doesn't fail")
-			}
-		} else {
-			opts = ignoreBTFOpts
+		err = have.RewriteConstants(map[string]interface{}{
+			"arg":  uint32(1),
+			"arg2": uint32(2),
+		})
+		if err != nil {
+			t.Fatal("Can't rewrite constant:", err)
 		}
 
-		if diff := cmp.Diff(coll, have, opts...); diff != "" {
+		err = have.RewriteConstants(map[string]interface{}{
+			"totallyBogus": uint32(1),
+		})
+		if err == nil {
+			t.Error("Rewriting a bogus constant doesn't fail")
+		}
+
+		if diff := cmp.Diff(coll, have, cmpOpts...); diff != "" {
 			t.Errorf("MapSpec mismatch (-want +got):\n%s", diff)
 		}
 
@@ -207,22 +198,23 @@ func TestLoadCollectionSpec(t *testing.T) {
 				PinPath: testutils.TempBPFFS(t),
 			},
 			Programs: ProgramOptions{
-				LogLevel: 1,
+				LogLevel: LogLevelBranch,
 			},
 		})
+
 		testutils.SkipIfNotSupported(t, err)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer coll.Close()
 
-		ret, _, err := coll.Programs["xdp_prog"].Test(make([]byte, 14))
+		ret, _, err := coll.Programs["xdp_prog"].Test(internal.EmptyBPFContext)
 		if err != nil {
 			t.Fatal("Can't run program:", err)
 		}
 
 		if ret != 7 {
-			t.Error("Expected return value to be 5, got", ret)
+			t.Error("Unexpected return value:", ret)
 		}
 	})
 }
@@ -255,7 +247,7 @@ func TestDataSections(t *testing.T) {
 	}
 	defer obj.Program.Close()
 
-	ret, _, err := obj.Program.Test(make([]byte, 14))
+	ret, _, err := obj.Program.Test(internal.EmptyBPFContext)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,6 +284,33 @@ func TestInlineASMConstant(t *testing.T) {
 		t.Fatal(err)
 	}
 	obj.Program.Close()
+}
+
+func TestFreezeRodata(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.9", "sk_lookup program type")
+
+	file := fmt.Sprintf("testdata/constants-%s.elf", internal.ClangEndian)
+	spec, err := LoadCollectionSpec(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var obj struct {
+		Program *Program `ebpf:"freeze_rodata"`
+	}
+
+	if err := spec.RewriteConstants(map[string]interface{}{
+		"ret": uint32(1),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = spec.LoadAndAssign(&obj, nil)
+	testutils.SkipIfNotSupported(t, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer obj.Program.Close()
 }
 
 func TestCollectionSpecDetach(t *testing.T) {
@@ -361,6 +380,19 @@ func TestLoadInitializedBTFMap(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		t.Run("NewCollection", func(t *testing.T) {
+			if coll.ByteOrder != internal.NativeEndian {
+				t.Skipf("Skipping %s collection", coll.ByteOrder)
+			}
+
+			tmp, err := NewCollection(coll)
+			testutils.SkipIfNotSupported(t, err)
+			if err != nil {
+				t.Fatal("NewCollection failed:", err)
+			}
+			tmp.Close()
+		})
+
 		t.Run("prog_array", func(t *testing.T) {
 			m, ok := coll.Maps["prog_array_init"]
 			if !ok {
@@ -395,6 +427,22 @@ func TestLoadInitializedBTFMap(t *testing.T) {
 				t.Error("expecting exactly 1 item in MapSpec contents")
 			}
 
+			if m.Key == nil {
+				t.Error("Expected non-nil key")
+			}
+
+			if m.Value == nil {
+				t.Error("Expected non-nil value")
+			}
+
+			if m.InnerMap.Key == nil {
+				t.Error("Expected non-nil InnerMap key")
+			}
+
+			if m.InnerMap.Value == nil {
+				t.Error("Expected non-nil InnerMap value")
+			}
+
 			p := m.Contents[0]
 			if cmp.Equal(p.Key, 1) {
 				t.Errorf("expecting MapSpec entry Key to equal 1, got %v", p.Key)
@@ -422,13 +470,62 @@ func TestLoadInvalidInitializedBTFMap(t *testing.T) {
 }
 
 func TestStringSection(t *testing.T) {
-	testutils.Files(t, testutils.Glob(t, "testdata/strings-*.elf"), func(t *testing.T, file string) {
-		_, err := LoadCollectionSpec(file)
-		t.Log(err)
-		if !errors.Is(err, ErrNotSupported) {
-			t.Error("References to a string section should be unsupported")
-		}
+	file := fmt.Sprintf("testdata/strings-%s.elf", internal.ClangEndian)
+	spec, err := LoadCollectionSpec(file)
+	if err != nil {
+		t.Fatalf("load collection spec: %s", err)
+	}
+
+	for name := range spec.Maps {
+		t.Log(name)
+	}
+
+	strMap := spec.Maps[".rodata.str1.1"]
+	if strMap == nil {
+		t.Fatal("Unable to find map '.rodata.str1.1' in loaded collection")
+	}
+
+	if !strMap.Freeze {
+		t.Fatal("Read only data maps should be frozen")
+	}
+
+	if strMap.Flags != unix.BPF_F_RDONLY_PROG {
+		t.Fatal("Read only data maps should have the prog-read-only flag set")
+	}
+
+	coll, err := NewCollection(spec)
+	testutils.SkipIfNotSupported(t, err)
+	if err != nil {
+		t.Fatalf("new collection: %s", err)
+	}
+	defer coll.Close()
+
+	prog := coll.Programs["filter"]
+	if prog == nil {
+		t.Fatal("program not found")
+	}
+
+	testMap := coll.Maps["my_map"]
+	if testMap == nil {
+		t.Fatal("test map not found")
+	}
+
+	_, err = prog.Run(&RunOptions{
+		Data: internal.EmptyBPFContext, // Min size for XDP programs
 	})
+	if err != nil {
+		t.Fatalf("prog run: %s", err)
+	}
+
+	key := []byte("This string is allocated in the string section\n\x00")
+	var value uint32
+	if err = testMap.Lookup(&key, &value); err != nil {
+		t.Fatalf("test map lookup: %s", err)
+	}
+
+	if value != 1 {
+		t.Fatal("Test map value not 1!")
+	}
 }
 
 func TestLoadRawTracepoint(t *testing.T) {
@@ -446,7 +543,7 @@ func TestLoadRawTracepoint(t *testing.T) {
 
 		coll, err := NewCollectionWithOptions(spec, CollectionOptions{
 			Programs: ProgramOptions{
-				LogLevel: 1,
+				LogLevel: LogLevelBranch,
 			},
 		})
 		testutils.SkipIfNotSupported(t, err)
@@ -482,7 +579,7 @@ func TestTailCall(t *testing.T) {
 		defer obj.TailMain.Close()
 		defer obj.ProgArray.Close()
 
-		ret, _, err := obj.TailMain.Test(make([]byte, 14))
+		ret, _, err := obj.TailMain.Test(internal.EmptyBPFContext)
 		testutils.SkipIfNotSupported(t, err)
 		if err != nil {
 			t.Fatal(err)
@@ -491,6 +588,224 @@ func TestTailCall(t *testing.T) {
 		// Expect the tail_1 tail call to be taken, returning value 42.
 		if ret != 42 {
 			t.Fatalf("Expected tail call to return value 42, got %d", ret)
+		}
+	})
+}
+
+func TestKconfigKernelVersion(t *testing.T) {
+	testutils.Files(t, testutils.Glob(t, "testdata/kconfig-*.elf"), func(t *testing.T, file string) {
+		spec, err := LoadCollectionSpec(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if spec.ByteOrder != internal.NativeEndian {
+			return
+		}
+
+		var obj struct {
+			Main *Program `ebpf:"kernel_version"`
+		}
+
+		testutils.SkipOnOldKernel(t, "5.2", "readonly maps")
+
+		err = spec.LoadAndAssign(&obj, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer obj.Main.Close()
+
+		ret, _, err := obj.Main.Test(internal.EmptyBPFContext)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		v, err := internal.KernelVersion()
+		if err != nil {
+			t.Fatalf("getting kernel version: %s", err)
+		}
+
+		version := v.Kernel()
+		if ret != version {
+			t.Fatalf("Expected eBPF to return value %d, got %d", version, ret)
+		}
+	})
+}
+
+func TestKconfigSyscallWrapper(t *testing.T) {
+	testutils.Files(t, testutils.Glob(t, "testdata/kconfig-*.elf"), func(t *testing.T, file string) {
+		spec, err := LoadCollectionSpec(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if spec.ByteOrder != internal.NativeEndian {
+			return
+		}
+
+		var obj struct {
+			Main *Program `ebpf:"syscall_wrapper"`
+		}
+
+		err = spec.LoadAndAssign(&obj, nil)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer obj.Main.Close()
+
+		ret, _, err := obj.Main.Test(internal.EmptyBPFContext)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var expected uint32
+		if testutils.IsKernelLessThan(t, "4.17") {
+			expected = 0
+		} else {
+			expected = 1
+		}
+
+		if ret != expected {
+			t.Fatalf("Expected eBPF to return value %d, got %d", expected, ret)
+		}
+	})
+}
+
+func TestKconfigConfig(t *testing.T) {
+	testutils.Files(t, testutils.Glob(t, "testdata/kconfig_config-*.elf"), func(t *testing.T, file string) {
+		spec, err := LoadCollectionSpec(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if spec.ByteOrder != internal.NativeEndian {
+			return
+		}
+
+		var obj struct {
+			Main     *Program `ebpf:"kconfig"`
+			ArrayMap *Map     `ebpf:"array_map"`
+		}
+
+		err = spec.LoadAndAssign(&obj, nil)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer obj.Main.Close()
+		defer obj.ArrayMap.Close()
+
+		_, _, err = obj.Main.Test(internal.EmptyBPFContext)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var value uint64
+		err = obj.ArrayMap.Lookup(uint32(0), &value)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// CONFIG_HZ must have a value.
+		qt.Assert(t, value, qt.Not(qt.Equals), 0)
+	})
+}
+
+func TestKfunc(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.18", "bpf_kfunc_call_test_mem_len_pass1")
+	testutils.Files(t, testutils.Glob(t, "testdata/kfunc-e*.elf"), func(t *testing.T, file string) {
+		spec, err := LoadCollectionSpec(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if spec.ByteOrder != internal.NativeEndian {
+			return
+		}
+
+		var obj struct {
+			Main *Program `ebpf:"call_kfunc"`
+		}
+
+		err = spec.LoadAndAssign(&obj, nil)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatalf("%v+", err)
+		}
+		defer obj.Main.Close()
+
+		ret, _, err := obj.Main.Test(internal.EmptyBPFContext)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if ret != 1 {
+			t.Fatalf("Expected kfunc to return value 1, got %d", ret)
+		}
+	})
+}
+
+func TestInvalidKfunc(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.18", "bpf_kfunc_call_test_mem_len_pass1")
+
+	if !haveTestmod(t) {
+		t.Skip("bpf_testmod not loaded")
+	}
+
+	file := fmt.Sprintf("testdata/invalid-kfunc-%s.elf", internal.ClangEndian)
+	coll, err := LoadCollection(file)
+	if err == nil {
+		coll.Close()
+		t.Fatal("Expected an error")
+	}
+
+	var ike *incompatibleKfuncError
+	if !errors.As(err, &ike) {
+		t.Fatalf("Expected an error wrapping incompatibleKfuncError, got %s", err)
+	}
+}
+
+func TestKfuncKmod(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.18", "Kernel module function calls")
+
+	if !haveTestmod(t) {
+		t.Skip("bpf_testmod not loaded")
+	}
+
+	testutils.Files(t, testutils.Glob(t, "testdata/kfunc-kmod-*.elf"), func(t *testing.T, file string) {
+		spec, err := LoadCollectionSpec(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if spec.ByteOrder != internal.NativeEndian {
+			return
+		}
+
+		var obj struct {
+			Main *Program `ebpf:"call_kfunc"`
+		}
+
+		err = spec.LoadAndAssign(&obj, nil)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatalf("%v+", err)
+		}
+		defer obj.Main.Close()
+
+		ret, _, err := obj.Main.Test(internal.EmptyBPFContext)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if ret != 1 {
+			t.Fatalf("Expected kfunc to return value 1, got %d", ret)
 		}
 	})
 }
@@ -521,7 +836,7 @@ func TestSubprogRelocation(t *testing.T) {
 		defer obj.Main.Close()
 		defer obj.HashMap.Close()
 
-		ret, _, err := obj.Main.Test(make([]byte, 14))
+		ret, _, err := obj.Main.Test(internal.EmptyBPFContext)
 		testutils.SkipIfNotSupported(t, err)
 		if err != nil {
 			t.Fatal(err)
@@ -638,7 +953,7 @@ func TestLibBPFCompat(t *testing.T) {
 	load := func(t *testing.T, spec *CollectionSpec, opts CollectionOptions, valid bool) {
 		// Disable retrying a program load with the log enabled, it leads
 		// to OOM kills.
-		opts.Programs.LogSize = -1
+		opts.Programs.LogDisabled = true
 
 		for name, p := range spec.Programs {
 			if p.Type != Extension {
@@ -658,7 +973,7 @@ func TestLibBPFCompat(t *testing.T) {
 			// replicating some fixups done in the selftests or the test
 			// intentionally failing. This is expected, so skip the test
 			// instead of failing.
-			t.Skip("Skipping since the kernel rejected the program:", errno)
+			t.Skip("Skipping since the kernel rejected the program:", err)
 		}
 		if err == nil {
 			coll.Close()
@@ -678,17 +993,29 @@ func TestLibBPFCompat(t *testing.T) {
 	)
 
 	testutils.Files(t, files, func(t *testing.T, path string) {
-		file := filepath.Base(path)
-		switch file {
-		case "test_map_in_map.o", "test_map_in_map.linked3.o",
-			"test_select_reuseport_kern.o", "test_select_reuseport_kern.linked3.o":
+		name := selftestName(path)
+		switch name {
+		case "test_map_in_map", "test_select_reuseport_kern":
 			t.Skip("Skipping due to missing InnerMap in map definition")
-		case "test_core_autosize.o":
+		case "test_core_autosize":
 			t.Skip("Skipping since the test generates dynamic BTF")
-		case "test_static_linked.linked3.o":
+		case "test_static_linked":
 			t.Skip("Skipping since .text contains 'subprog' twice")
-		case "linked_maps.linked3.o", "linked_funcs.linked3.o":
+		case "linked_maps", "linked_funcs", "linked_vars", "kprobe_multi",
+			"test_ksyms_weak", "test_ksyms_module", "test_ksyms":
 			t.Skip("Skipping since weak relocations are not supported")
+		case "bloom_filter_map", "bloom_filter_bench":
+			t.Skip("Skipping due to missing MapExtra field in MapSpec")
+		case "netif_receive_skb":
+			t.Skip("Skipping due to possible bug in upstream CO-RE generation")
+		case "test_usdt", "test_urandom_usdt", "test_usdt_multispec":
+			t.Skip("Skipping due to missing support for usdt.bpf.h")
+		case "lsm_cgroup", "bpf_iter_ipv6_route", "test_core_extern",
+			"profiler1", "profiler2", "profiler3":
+			t.Skip("Skipping due to using weak CONFIG_* variables")
+		case "linked_maps1", "linked_maps2", "linked_funcs1", "linked_funcs2",
+			"test_subskeleton", "test_subskeleton_lib":
+			t.Skip("Skipping due to relying on cross ELF linking")
 		}
 
 		t.Parallel()
@@ -696,11 +1023,11 @@ func TestLibBPFCompat(t *testing.T) {
 		spec, err := LoadCollectionSpec(path)
 		testutils.SkipIfNotSupported(t, err)
 		if err != nil {
-			t.Fatalf("Can't read %s: %s", file, err)
+			t.Fatal(err)
 		}
 
-		switch file {
-		case "test_sk_assign.o":
+		switch name {
+		case "test_sk_assign":
 			// Test contains a legacy iproute2 bpf_elf_map definition.
 			for _, m := range spec.Maps {
 				if m.Extra == nil || m.Extra.Len() == 0 {
@@ -727,34 +1054,34 @@ func TestLibBPFCompat(t *testing.T) {
 		}
 
 		for _, coreFile := range coreFiles {
-			name := filepath.Base(coreFile)
+			name := selftestName(coreFile)
 			t.Run(name, func(t *testing.T) {
 				// Some files like btf__core_reloc_arrays___err_too_small.o
 				// trigger an error on purpose. Use the name to infer whether
 				// the test should succeed.
 				var valid bool
 				switch name {
-				case "btf__core_reloc_existence___err_wrong_arr_kind.o",
-					"btf__core_reloc_existence___err_wrong_arr_value_type.o",
-					"btf__core_reloc_existence___err_wrong_int_kind.o",
-					"btf__core_reloc_existence___err_wrong_int_sz.o",
-					"btf__core_reloc_existence___err_wrong_int_type.o",
-					"btf__core_reloc_existence___err_wrong_struct_type.o":
+				case "btf__core_reloc_existence___err_wrong_arr_kind",
+					"btf__core_reloc_existence___err_wrong_arr_value_type",
+					"btf__core_reloc_existence___err_wrong_int_kind",
+					"btf__core_reloc_existence___err_wrong_int_sz",
+					"btf__core_reloc_existence___err_wrong_int_type",
+					"btf__core_reloc_existence___err_wrong_struct_type":
 					// These tests are buggy upstream, see https://lore.kernel.org/bpf/20210420111639.155580-1-lmb@cloudflare.com/
 					valid = true
-				case "btf__core_reloc_ints___err_wrong_sz_16.o",
-					"btf__core_reloc_ints___err_wrong_sz_32.o",
-					"btf__core_reloc_ints___err_wrong_sz_64.o",
-					"btf__core_reloc_ints___err_wrong_sz_8.o",
-					"btf__core_reloc_arrays___err_wrong_val_type1.o",
-					"btf__core_reloc_arrays___err_wrong_val_type2.o":
+				case "btf__core_reloc_ints___err_wrong_sz_16",
+					"btf__core_reloc_ints___err_wrong_sz_32",
+					"btf__core_reloc_ints___err_wrong_sz_64",
+					"btf__core_reloc_ints___err_wrong_sz_8",
+					"btf__core_reloc_arrays___err_wrong_val_type1",
+					"btf__core_reloc_arrays___err_wrong_val_type2":
 					// These tests are valid according to current libbpf behaviour,
 					// see commit 42765ede5c54ca915de5bfeab83be97207e46f68.
 					valid = true
-				case "btf__core_reloc_type_id___missing_targets.o",
-					"btf__core_reloc_flavors__err_wrong_name.o":
+				case "btf__core_reloc_type_id___missing_targets",
+					"btf__core_reloc_flavors__err_wrong_name":
 					valid = false
-				case "btf__core_reloc_ints___err_bitfield.o":
+				case "btf__core_reloc_ints___err_bitfield":
 					// Bitfields are now valid.
 					valid = true
 				default:
@@ -781,28 +1108,33 @@ func TestLibBPFCompat(t *testing.T) {
 }
 
 func loadTargetProgram(tb testing.TB, name string, opts CollectionOptions) (*Program, *Collection) {
-	file := "test_pkt_access.o"
+	file := "test_pkt_access.bpf.o"
 	program := "test_pkt_access"
 	switch name {
 	case "new_connect_v4_prog":
-		file = "connect4_prog.o"
+		file = "connect4_prog.bpf.o"
 		program = "connect_v4_prog"
 	case "new_do_bind":
-		file = "connect4_prog.o"
+		file = "connect4_prog.bpf.o"
 		program = "connect_v4_prog"
 	case "freplace_cls_redirect_test":
-		file = "test_cls_redirect.o"
+		file = "test_cls_redirect.bpf.o"
 		program = "cls_redirect"
 	case "new_handle_kprobe":
-		file = "test_attach_probe.o"
+		file = "test_attach_probe.bpf.o"
 		program = "handle_kprobe"
 	case "test_pkt_md_access_new":
-		file = "test_pkt_md_access.o"
+		file = "test_pkt_md_access.bpf.o"
 		program = "test_pkt_md_access"
 	default:
 	}
 
 	spec, err := LoadCollectionSpec(filepath.Join(*elfPath, file))
+	if errors.Is(err, os.ErrNotExist) && strings.HasSuffix(file, ".bpf.o") {
+		// Prior to v6.1 BPF ELF used a plain .o suffix.
+		file = strings.TrimSuffix(file, ".bpf.o") + ".o"
+		spec, err = LoadCollectionSpec(filepath.Join(*elfPath, file))
+	}
 	if err != nil {
 		tb.Fatalf("Can't read %s: %s", file, err)
 	}
@@ -857,10 +1189,22 @@ func TestGetProgType(t *testing.T) {
 			At: AttachNone,
 			To: "",
 		},
+		"xdp.frags/foo": {
+			Pt: XDP,
+			At: AttachNone,
+			To: "",
+			Fl: unix.BPF_F_XDP_HAS_FRAGS,
+		},
 		"xdp_devmap/foo": {
 			Pt: XDP,
 			At: AttachXDPDevMap,
 			To: "foo",
+		},
+		"xdp.frags_devmap/foo": {
+			Pt: XDP,
+			At: AttachXDPDevMap,
+			To: "foo",
+			Fl: unix.BPF_F_XDP_HAS_FRAGS,
 		},
 		"cgroup_skb/ingress": {
 			Pt: CGroupSKB,
@@ -902,4 +1246,23 @@ func TestGetProgType(t *testing.T) {
 			t.Errorf("getProgType mismatch (-want +got):\n%s", diff)
 		}
 	}
+}
+
+// selftestName takes a path to a file and derives a canonical name from it.
+//
+// It strips various suffixes used by the selftest build system.
+func selftestName(path string) string {
+	file := filepath.Base(path)
+
+	name := strings.TrimSuffix(file, ".o")
+	// Strip various suffixes.
+	// Various linking suffixes.
+	name = strings.TrimSuffix(name, ".linked3")
+	name = strings.TrimSuffix(name, ".llinked1")
+	name = strings.TrimSuffix(name, ".llinked2")
+	name = strings.TrimSuffix(name, ".llinked3")
+	// v6.1 started adding .bpf to all BPF ELF.
+	name = strings.TrimSuffix(name, ".bpf")
+
+	return name
 }

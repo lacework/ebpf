@@ -12,8 +12,15 @@ import (
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/internal/sys"
 	"github.com/cilium/ebpf/internal/testutils"
+	"github.com/cilium/ebpf/internal/testutils/fdtrace"
 	"github.com/cilium/ebpf/internal/unix"
+
+	qt "github.com/frankban/quicktest"
 )
+
+func TestMain(m *testing.M) {
+	fdtrace.TestMain(m)
+}
 
 func TestRawLink(t *testing.T) {
 	cgroup, prog := mustCgroupFixtures(t)
@@ -50,8 +57,39 @@ func TestRawLink(t *testing.T) {
 	testLink(t, &linkCgroup{*link}, prog)
 }
 
+func TestUnpinRawLink(t *testing.T) {
+	cgroup, prog := mustCgroupFixtures(t)
+	link, _ := newPinnedRawLink(t, cgroup, prog)
+	defer link.Close()
+
+	qt.Assert(t, link.IsPinned(), qt.IsTrue)
+
+	if err := link.Unpin(); err != nil {
+		t.Fatal(err)
+	}
+
+	qt.Assert(t, link.IsPinned(), qt.IsFalse)
+}
+
 func TestRawLinkLoadPinnedWithOptions(t *testing.T) {
 	cgroup, prog := mustCgroupFixtures(t)
+	link, path := newPinnedRawLink(t, cgroup, prog)
+	defer link.Close()
+
+	qt.Assert(t, link.IsPinned(), qt.IsTrue)
+
+	// It seems like the kernel ignores BPF_F_RDONLY when updating a link,
+	// so we can't test this.
+	_, err := loadPinnedRawLink(path, &ebpf.LoadPinOptions{
+		Flags: math.MaxUint32,
+	})
+	if !errors.Is(err, unix.EINVAL) {
+		t.Fatal("Invalid flags don't trigger an error:", err)
+	}
+}
+
+func newPinnedRawLink(t *testing.T, cgroup *os.File, prog *ebpf.Program) (*RawLink, string) {
+	t.Helper()
 
 	link, err := AttachRawLink(RawLinkOptions{
 		Target:  int(cgroup.Fd()),
@@ -70,14 +108,7 @@ func TestRawLinkLoadPinnedWithOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// It seems like the kernel ignores BPF_F_RDONLY when updating a link,
-	// so we can't test this.
-	_, err = loadPinnedRawLink(path, &ebpf.LoadPinOptions{
-		Flags: math.MaxUint32,
-	})
-	if !errors.Is(err, unix.EINVAL) {
-		t.Fatal("Invalid flags don't trigger an error:", err)
-	}
+	return link, path
 }
 
 func mustCgroupFixtures(t *testing.T) (*os.File, *ebpf.Program) {
@@ -173,6 +204,36 @@ func testLink(t *testing.T, link Link, prog *ebpf.Program) {
 			if xdp.Ifindex == 0 {
 				t.Fatalf("Failed to get link XDP extra info")
 			}
+		}
+	})
+
+	type FDer interface {
+		FD() int
+	}
+
+	t.Run("from fd", func(t *testing.T) {
+		fder, ok := link.(FDer)
+		if !ok {
+			t.Skip("Link doesn't allow retrieving FD")
+		}
+
+		// We need to dup the FD since NewLinkFromFD takes
+		// ownership.
+		dupFD, err := unix.FcntlInt(uintptr(fder.FD()), unix.F_DUPFD_CLOEXEC, 1)
+		if err != nil {
+			t.Fatal("Can't dup link FD:", err)
+		}
+		defer unix.Close(dupFD)
+
+		newLink, err := NewLinkFromFD(dupFD)
+		testutils.SkipIfNotSupported(t, err)
+		if err != nil {
+			t.Fatal("Can't create new link from dup link FD:", err)
+		}
+		defer newLink.Close()
+
+		if reflect.TypeOf(newLink) != reflect.TypeOf(link) {
+			t.Fatalf("Expected type %T, got %T", link, newLink)
 		}
 	})
 

@@ -3,10 +3,12 @@ package ebpf
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/internal"
 	"github.com/cilium/ebpf/internal/sys"
 	"github.com/cilium/ebpf/internal/testutils"
@@ -117,13 +119,24 @@ func TestProgramInfo(t *testing.T) {
 			} else if name == "proc" && ok {
 				t.Error("Expected ID to not be available")
 			}
+
+			if name == "proc" {
+				_, ok := info.CreatedByUID()
+				qt.Assert(t, ok, qt.IsFalse)
+			} else {
+				uid, ok := info.CreatedByUID()
+				if testutils.IsKernelLessThan(t, "4.15") {
+					qt.Assert(t, ok, qt.IsFalse)
+				} else {
+					qt.Assert(t, ok, qt.IsTrue)
+					qt.Assert(t, uid, qt.Equals, uint32(os.Getuid()))
+				}
+			}
 		})
 	}
 }
 
 func TestProgramInfoMapIDs(t *testing.T) {
-	testutils.SkipOnOldKernel(t, "4.10", "reading program info")
-
 	arr, err := NewMap(&MapSpec{
 		Type:       Array,
 		KeySize:    4,
@@ -146,21 +159,52 @@ func TestProgramInfoMapIDs(t *testing.T) {
 	defer prog.Close()
 
 	info, err := prog.Info()
+	testutils.SkipIfNotSupported(t, err)
 	qt.Assert(t, err, qt.IsNil)
 
 	ids, ok := info.MapIDs()
-	if testutils.MustKernelVersion().Less(internal.Version{4, 15, 0}) {
+	switch {
+	case testutils.IsKernelLessThan(t, "4.15"):
 		qt.Assert(t, ok, qt.IsFalse)
 		qt.Assert(t, ids, qt.HasLen, 0)
-	} else {
+
+	default:
 		qt.Assert(t, ok, qt.IsTrue)
-		qt.Assert(t, ids, qt.HasLen, 1)
 
 		mapInfo, err := arr.Info()
 		qt.Assert(t, err, qt.IsNil)
+
 		mapID, ok := mapInfo.ID()
 		qt.Assert(t, ok, qt.IsTrue)
-		qt.Assert(t, ids[0], qt.Equals, mapID)
+		qt.Assert(t, ids, qt.ContentEquals, []MapID{mapID})
+	}
+}
+
+func TestProgramInfoMapIDsNoMaps(t *testing.T) {
+	prog, err := NewProgram(&ProgramSpec{
+		Type: SocketFilter,
+		Instructions: asm.Instructions{
+			asm.LoadImm(asm.R0, 0, asm.DWord),
+			asm.Return(),
+		},
+		License: "MIT",
+	})
+	qt.Assert(t, err, qt.IsNil)
+	defer prog.Close()
+
+	info, err := prog.Info()
+	testutils.SkipIfNotSupported(t, err)
+	qt.Assert(t, err, qt.IsNil)
+
+	ids, ok := info.MapIDs()
+	switch {
+	case testutils.IsKernelLessThan(t, "4.15"):
+		qt.Assert(t, ok, qt.IsFalse)
+		qt.Assert(t, ids, qt.HasLen, 0)
+
+	default:
+		qt.Assert(t, ok, qt.IsTrue)
+		qt.Assert(t, ids, qt.HasLen, 0)
 	}
 }
 
@@ -246,7 +290,7 @@ func BenchmarkStats(b *testing.B) {
 // be of a specific value after a call to Test() is therefore not possible.
 // See https://golang.org/doc/go1.14#runtime for more details.
 func testStats(prog *Program) error {
-	in := make([]byte, 14)
+	in := internal.EmptyBPFContext
 
 	stats, err := EnableStats(uint32(unix.BPF_STATS_RUN_TIME))
 	if err != nil {
@@ -317,4 +361,47 @@ func testStats(prog *Program) error {
 	}
 
 	return nil
+}
+
+func TestHaveProgramInfoMapIDs(t *testing.T) {
+	testutils.CheckFeatureTest(t, haveProgramInfoMapIDs)
+}
+
+func TestProgInfoExtBTF(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.0", "Program BTF (func/line_info)")
+
+	spec, err := LoadCollectionSpec("testdata/raw_tracepoint-el.elf")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	coll, err := NewCollection(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coll.Close()
+
+	info, err := coll.Programs["sched_process_exec"].Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inst, err := info.Instructions()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const expectedSource = "\treturn 0;"
+	if inst[0].Source().String() != expectedSource {
+		t.Fatalf("Source of first instruction incorrect. Got '%s', expected: '%s'", inst[0].Source().String(), expectedSource)
+	}
+
+	fn := btf.FuncMetadata(&inst[0])
+	if fn == nil {
+		t.Fatal("Func metadata missing")
+	}
+
+	if fn.Name != "sched_process_exec" {
+		t.Fatalf("Func metadata incorrect. Got '%s', expected: 'sched_process_exec'", fn.Name)
+	}
 }
