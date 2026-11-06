@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"io"
 	"unsafe"
-
-	"github.com/cilium/ebpf/internal"
 )
 
 //go:generate go run golang.org/x/tools/cmd/stringer@latest -linecomment -output=btf_types_string.go -type=FuncLinkage,VarLinkage,btfKind
@@ -122,7 +120,10 @@ func parseBTFHeader(r io.Reader, bo binary.ByteOrder) (*btfHeader, error) {
 		return nil, errors.New("header length shorter than btfHeader size")
 	}
 
-	if _, err := io.CopyN(internal.DiscardZeroes{}, r, remainder); err != nil {
+	// Linux 7.x headers append layout_off and layout_len, which are non-zero
+	// when the BTF has a layout section. Skip them: types and strings are read
+	// at their own offsets, so the layout section is never parsed.
+	if _, err := io.CopyN(io.Discard, r, remainder); err != nil {
 		return nil, fmt.Errorf("header padding: %v", err)
 	}
 
